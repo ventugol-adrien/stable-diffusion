@@ -1,0 +1,238 @@
+openapi: 3.1.0
+info:
+  title: Stable Diffusion XL Inference Server
+  description: >
+    High-performance SDXL image generation API optimized for AMD RDNA 4 GPUs.
+    Supports text-to-image, image-to-image, LoRA adapters, and lightning mode.
+  version: 1.0.0
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /generate/image/:
+    post:
+      operationId: generateImage
+      summary: Generate images from a text prompt
+      description: >
+        Generates one or more SDXL images based on the provided prompt and
+        parameters. Returns a ZIP archive containing the generated PNG images
+        and a `metrics.json` file with timing information.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageRequest"
+            examples:
+              basic:
+                summary: Simple text-to-image
+                value:
+                  user_input: "a cat sitting on a windowsill at sunset"
+              lightning:
+                summary: Fast generation with lightning mode
+                value:
+                  user_input: "cyberpunk cityscape at night"
+                  lightning: true
+                  batch_size: 2
+              with_loras:
+                summary: Generation with LoRA adapters
+                value:
+                  user_input: "portrait of a woman in a garden"
+                  model: "juggernaut"
+                  loras:
+                    - name: "detail_enhancer"
+                      scale: 0.7
+      responses:
+        "200":
+          description: ZIP archive containing generated images and metrics
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+                description: >
+                  ZIP file containing:
+                  - `metrics.json` with latency, throughput, and timing breakdown
+                  - `image_0.png`, `image_1.png`, ... for each generated image
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: "attachment; filename=results.zip"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+
+  /models/:
+    get:
+      operationId: listModels
+      summary: List available models
+      description: >
+        Returns an array of model identifiers available for generation.
+        Each identifier corresponds to a `.safetensors` file in the models
+        directory.
+      responses:
+        "200":
+          description: Array of model identifier strings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+              example: ["juggernaut", "pony"]
+
+components:
+  schemas:
+    LoRA:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: >
+            LoRA adapter filename (without `.safetensors` extension) located
+            in the `~/sd_loras/` directory.
+          example: "detail_enhancer"
+        scale:
+          type: number
+          format: float
+          default: 0.5
+          minimum: 0
+          maximum: 2
+          description: Adapter influence scale.
+          example: 0.7
+
+    ImageRequest:
+      type: object
+      required:
+        - user_input
+      properties:
+        user_input:
+          type: string
+          description: Text prompt describing the desired image.
+          example: "a cat sitting on a windowsill at sunset"
+        model:
+          type: string
+          default: "juggernaut"
+          description: >
+            Model identifier. Must match a `.safetensors` filename in the
+            models directory or a cached diffusers model.
+          example: "juggernaut"
+        loras:
+          type: array
+          items:
+            $ref: "#/components/schemas/LoRA"
+          default: []
+          description: List of LoRA adapters to apply during generation.
+        lightning:
+          type: boolean
+          default: false
+          description: >
+            Enable lightning mode for faster inference (8 steps, CFG 1.5)
+            instead of standard mode (25 steps, CFG 7.0).
+        batch_size:
+          type: integer
+          default: 1
+          minimum: 1
+          description: Number of images to generate per request.
+          example: 1
+        reference:
+          type: string
+          format: byte
+          nullable: true
+          default: null
+          description: >
+            Base64-encoded reference image bytes for image-to-image generation.
+        reference_strength:
+          type: number
+          format: float
+          nullable: true
+          default: null
+          description: Denoising strength for image-to-image (0.0–1.0).
+        image_seed:
+          type: integer
+          default: -1
+          description: >
+            Seed for the image generation RNG. Use `-1` for a random seed.
+          example: -1
+        prompt_seed:
+          type: integer
+          default: -1
+          description: >
+            Seed for prompt processing RNG. Use `-1` for a random seed.
+          example: -1
+
+    GenerationMetrics:
+      type: object
+      description: Performance metrics included in the response ZIP as `metrics.json`.
+      properties:
+        latency:
+          type: number
+          format: float
+          description: Total wall-clock time in seconds.
+          example: 4.82
+        throughput:
+          type: number
+          format: float
+          description: Images per second.
+          example: 0.207
+        breakdown:
+          type: object
+          properties:
+            pipeline_load_time:
+              type: number
+              format: float
+              description: Time to load or retrieve the cached pipeline.
+              example: 0.001
+            lora_load_time:
+              type: number
+              format: float
+              description: Time to load LoRA adapters.
+              example: 0.0
+            prompt_processing_time:
+              type: number
+              format: float
+              description: Time for prompt conditioning via Compel.
+              example: 0.12
+            generation_time:
+              type: number
+              format: float
+              description: Time for diffusion inference and VAE decode.
+              example: 4.70
+
+    ValidationError:
+      type: object
+      required:
+        - loc
+        - msg
+        - type
+      properties:
+        loc:
+          type: array
+          items:
+            anyOf:
+              - type: string
+              - type: integer
+          description: Location of the error in the request.
+        msg:
+          type: string
+          description: Human-readable error message.
+        type:
+          type: string
+          description: Error type identifier.
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationError"
