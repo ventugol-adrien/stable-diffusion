@@ -1,5 +1,11 @@
 from random import randint
-from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline, EulerAncestralDiscreteScheduler, AutoencoderKL
+from diffusers import (
+    StableDiffusionXLPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    AutoPipelineForImage2Image,
+    EulerAncestralDiscreteScheduler,
+    AutoencoderKL,
+)
 from pathlib import Path
 import os, gc, time
 import torch
@@ -13,6 +19,7 @@ CWD = Path(os.getcwd())
 MODEL_CACHE_DIR = CWD / "caches" / "models"
 WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
+
 
 def cleanup_resources():
     """
@@ -41,6 +48,7 @@ def cleanup_resources():
     gc.collect()
     torch.cuda.empty_cache()
     print("🧹 VRAM resources released.")
+
 
 def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
     """
@@ -82,6 +90,7 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
     pipe.save_pretrained(cached_dir)
 
     return pipe
+
 
 def get_pipe(model: str = "juggernaut"):
     """
@@ -136,8 +145,14 @@ def get_pipe(model: str = "juggernaut"):
     _cached_model_name = model
 
     return pipe
+
+
 def get_fast_pipe(model: str = "juggernaut"): ...
-def warmup_pipeline(pipe : StableDiffusionXLPipeline | StableDiffusionXLImg2ImgPipeline, width:int=1024, height:int=1024):
+def warmup_pipeline(
+    pipe: StableDiffusionXLPipeline | StableDiffusionXLImg2ImgPipeline,
+    width: int = 1024,
+    height: int = 1024,
+):
     def run_warmup():
         # Run a single forward pass with dummy data to warm up the model
         generator = torch.Generator("cuda").manual_seed(42)
@@ -178,7 +193,7 @@ def warmup_pipeline(pipe : StableDiffusionXLPipeline | StableDiffusionXLImg2ImgP
         except Exception:
             _warmed_configs_cache = set()
         return _warmed_configs_cache
-    
+
     def save_warmup(key: str):
         """Add a config key to the tracked set and persist to disk."""
         import json
@@ -198,13 +213,12 @@ def warmup_pipeline(pipe : StableDiffusionXLPipeline | StableDiffusionXLImg2ImgP
     run_warmup()
     print(f"   Warmed in {time.monotonic() - t0:.1f}s")
     save_warmup(f"{model}_{width}x{height}_1step")
-    
+
     gc.collect()
     torch.cuda.empty_cache()
 
-def generate_image(
-    pipe: StableDiffusionXLPipeline | StableDiffusionXLImg2ImgPipeline, **kwargs
-):
+
+def generate_image(pipe, **kwargs):
     real_image_seed = kwargs.get("image_seed", -1)
     if real_image_seed == -1:
         real_image_seed = randint(0, 2**32 - 1)
