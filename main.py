@@ -1,5 +1,6 @@
+import base64
 from contextlib import asynccontextmanager
-import io , os, json , time
+import io, os, json, time
 from random import randint
 from pathlib import Path
 import zipfile
@@ -8,6 +9,8 @@ from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.models import ImageRequest
 from compel import CompelForSDXL
+from diffusers import AutoPipelineForImage2Image, StableDiffusionUpscalePipeline
+from PIL import Image, ImageOps
 
 from src.pipeline import (
     get_pipe,
@@ -86,7 +89,7 @@ def handle_generate_image(request: ImageRequest):
     # Track which LoRA combos are used (currently none here)
     if request.loras:
         add_loras(pipe, request.loras)
-    
+
     t_to_loras = time.monotonic() - t_to_pipeline
     breakdown["lora_load_time"] = t_to_loras
 
@@ -98,15 +101,35 @@ def handle_generate_image(request: ImageRequest):
     t_to_prompt = time.monotonic() - t_to_loras
     breakdown["prompt_processing_time"] = t_to_prompt
 
+    init_image = None
+    if request.reference:
+        print("🖼️ Reference image provided, preparing for img2img generation...")
+        init_image = request.reference
+        if "," in init_image:
+            # Split at the comma and keep only the actual data portion
+            init_image = init_image.split(",")[1]
+        image_bytes = base64.b64decode(init_image)
+        init_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        if init_image.width < 1024 or init_image.height < 1024:
+            upscale_pipe = StableDiffusionUpscalePipeline.from_pretrained(
+                "stabilityai/stable-diffusion-x4-upscaler", torch_dtype=torch.float16
+            ).to("cuda")
+            init_image = upscale_pipe(prompt=positive_prompt, image=init_image).images[
+                0
+            ]
+        init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
+        pipe = AutoPipelineForImage2Image.from_pipe(pipe)
+
     images = generate_image(
         pipe=pipe,
         prompt_embeds=conditioning.embeds,
         pooled_prompt_embeds=conditioning.pooled_embeds,
         negative_prompt_embeds=conditioning.negative_embeds,
         negative_pooled_prompt_embeds=conditioning.negative_pooled_embeds,
-        image_bytes=request.reference if request.reference else None,
-        strength=0.6,
-        num_inference_steps=8 if request.lightning else 25,
+        image=init_image,
+        strength=request.strength if request.strength is not None else 0.6,
+        num_inference_steps=8 if request.lightning else 30,
         cfg=1.5 if request.lightning else 7.0,
         height=1024,
         width=1024,
@@ -120,7 +143,7 @@ def handle_generate_image(request: ImageRequest):
     throughput = request.batch_size / latency if latency > 0 else 0
 
     zip_buffer = io.BytesIO()
-    metrics = {"latency":latency, "throughput": throughput, "breakdown": breakdown}
+    metrics = {"latency": latency, "throughput": throughput, "breakdown": breakdown}
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         zip_file.writestr("metrics.json", json.dumps(metrics))
@@ -128,8 +151,6 @@ def handle_generate_image(request: ImageRequest):
             img_buffer = io.BytesIO()
             img.save(img_buffer, format="PNG")
             zip_file.writestr(f"image_{i}.png", img_buffer.getvalue())
-    
-    
 
     return Response(
         content=zip_buffer.getvalue(),
