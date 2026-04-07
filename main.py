@@ -9,7 +9,12 @@ from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.models import ImageRequest
 from compel import CompelForSDXL
-from diffusers import AutoPipelineForImage2Image, StableDiffusionUpscalePipeline
+from diffusers import (
+    AutoPipelineForImage2Image,
+    StableDiffusionUpscalePipeline,
+    StableDiffusionXLControlNetPipeline,
+    ControlNetModel,
+)
 from PIL import Image, ImageOps
 from diffusers import AutoPipelineForImage2Image
 from PIL import Image
@@ -20,6 +25,7 @@ from src.pipeline import (
     warmup_pipeline,
     generate_image,
     shutdown,
+    MODEL_CACHE_DIR,
 )
 from src.loras import add_loras, record_lora_config
 from src.prompt import process_prompt
@@ -127,16 +133,31 @@ def handle_generate_image(request: ImageRequest):
         init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
         pipe = AutoPipelineForImage2Image.from_pipe(pipe)
 
-    init_image = None
-    if request.reference:
-        print("🖼️ Reference image provided, preparing for img2img generation...")
-        init_image = request.reference
-        if "," in init_image:
-            # Split at the comma and keep only the actual data portion
-            init_image = init_image.split(",")[1]
-        image_bytes = base64.b64decode(init_image)
-        init_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        pipe = AutoPipelineForImage2Image.from_pipe(pipe)
+    if request.depthmap:
+        print("🕳️ Depth map provided, applying ControlNet conditioning...")
+        depthmap_bytes = base64.b64decode(request.depthmap)
+        init_image = Image.open(io.BytesIO(depthmap_bytes)).convert("RGB")
+        controlnet = ControlNetModel.from_pretrained(
+            "diffusers/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16
+        ).to("cuda")
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            MODEL_CACHE_DIR / request.model,
+            controlnet=controlnet,
+            torch_dtype=torch.float16,
+        ).to("cuda")
+        if request.ip_adapter_image and request.ip_adapter_scale:
+            print("🧩 IP-Adapter image and scale provided, adding to pipeline...")
+            ip_adapter_image_bytes = base64.b64decode(request.ip_adapter_image)
+            ip_adapter_image = Image.open(io.BytesIO(ip_adapter_image_bytes)).convert(
+                "RGB"
+            )
+            pipe.load_ip_adapter(
+                "h94/IP-Adapter",
+                subfolder="sdxl_models",
+                weight_name="ip-adapter_sdxl.bin",
+                force_download=True,
+            )
+            pipe.set_ip_adapter_scale(request.ip_adapter_scale)
 
     images = generate_image(
         pipe=pipe,
@@ -151,6 +172,10 @@ def handle_generate_image(request: ImageRequest):
         height=1024,
         width=1024,
         num_images_per_prompt=request.batch_size,
+        ip_adapter_image=(
+            ip_adapter_image if (ip_adapter_image := request.ip_adapter_image) else None
+        ),
+        ip_adapter_scale=request.ip_adapter_scale if request.ip_adapter_scale else None,
     )
     t_to_generation = time.monotonic() - t_to_prompt
     breakdown["generation_time"] = t_to_generation

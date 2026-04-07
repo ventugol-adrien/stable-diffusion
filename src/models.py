@@ -13,6 +13,9 @@ class ImageRequest(BaseModel):
     model: str = os.environ.get("DEFAULT_MODEL", "juggernaut")
     strength: float = None
     reference: str = None
+    depthmap: str = None
+    ip_adapter_scale: float = None
+    ip_adapter_image: str = None
     lightning: bool = False
     image_seed: int = -1
     prompt_seed: int = -1
