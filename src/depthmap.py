@@ -103,10 +103,10 @@ class DepthMapGenerator:
             return False
 
 
-router = APIRouter(tags=["depthmap"])
+router = APIRouter(prefix="/depthmap", tags=["Depth Map Generation"])
 
 
-@router.post("/depthmap")
+@router.post("/")
 def generate_depth_map(request: DepthMapRequest) -> dict:
     """
     API endpoint to generate a depth map from an input image.
@@ -118,10 +118,11 @@ def generate_depth_map(request: DepthMapRequest) -> dict:
         dict: A response containing success status and message.
     """
     generator = DepthMapGenerator()
-    img_bytes = base64.b64decode(request.input_image.split(",")[1])
+    raw = request.input_image
+    img_bytes = base64.b64decode(raw.split(",")[1] if "," in raw else raw)
     depth_map = generator.process(img_bytes)
 
     if depth_map:
-        return Response(content=depth_map, media_type="image/png")
+        return Response(content=base64.b64decode(depth_map), media_type="image/png")
     else:
         return {"success": False, "message": "Failed to generate depth map."}

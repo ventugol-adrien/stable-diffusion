@@ -9,6 +9,8 @@ from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.models import ImageRequest
 from compel import CompelForSDXL
+from diffusers import AutoPipelineForImage2Image, StableDiffusionUpscalePipeline
+from PIL import Image, ImageOps
 from diffusers import AutoPipelineForImage2Image
 from PIL import Image
 
@@ -104,6 +106,26 @@ def handle_generate_image(request: ImageRequest):
 
     t_to_prompt = time.monotonic() - t_to_loras
     breakdown["prompt_processing_time"] = t_to_prompt
+
+    init_image = None
+    if request.reference:
+        print("🖼️ Reference image provided, preparing for img2img generation...")
+        init_image = request.reference
+        if "," in init_image:
+            # Split at the comma and keep only the actual data portion
+            init_image = init_image.split(",")[1]
+        image_bytes = base64.b64decode(init_image)
+        init_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        if init_image.width < 1024 or init_image.height < 1024:
+            upscale_pipe = StableDiffusionUpscalePipeline.from_pretrained(
+                "stabilityai/stable-diffusion-x4-upscaler", torch_dtype=torch.float16
+            ).to("cuda")
+            init_image = upscale_pipe(prompt=positive_prompt, image=init_image).images[
+                0
+            ]
+        init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
+        pipe = AutoPipelineForImage2Image.from_pipe(pipe)
 
     init_image = None
     if request.reference:
