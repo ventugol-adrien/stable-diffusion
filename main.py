@@ -22,6 +22,8 @@ from src.pipeline import (
 from src.loras import add_loras, record_lora_config
 from src.prompt import process_prompt
 
+from src.depthmap import router as depthmap_router
+
 import torch
 
 MODELS_DIR = Path.home() / "sd_models"
@@ -73,8 +75,10 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+app.include_router(depthmap_router)
 
-@app.post("/generate/image/")
+
+@app.post("/generate/image")
 def handle_generate_image(request: ImageRequest):
     breakdown = {}
     start_time = time.monotonic()
@@ -152,7 +156,7 @@ def handle_generate_image(request: ImageRequest):
     )
 
 
-@app.get("/models/")
+@app.get("/models")
 def get_models():
     """Return a list of available models and their active LoRAs."""
     model_safetensors = [f.stem for f in MODELS_DIR.glob("*.safetensors")]
