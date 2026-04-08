@@ -30,7 +30,7 @@ from src.pipeline import (
 from src.loras import add_loras, record_lora_config
 from src.prompt import process_prompt
 
-from src.depthmap import router as depthmap_router
+from src.controlnet import router as depthmap_router
 
 import torch
 
