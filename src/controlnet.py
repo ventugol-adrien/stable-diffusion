@@ -3,11 +3,15 @@ import zipfile
 import logging
 import torch
 import base64
+from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 from transformers import pipeline
 from fastapi import APIRouter
 from fastapi.responses import Response
 from pydantic import BaseModel
+from controlnet_aux import PidiNetDetector
+
+ANNOTATORS_DIR = Path.home() / "sd_annotators"
 
 
 class AssetRequest(BaseModel):
@@ -59,20 +63,21 @@ class ControlNetAssetGenerator:
             logger.error(f"Critical error loading depth model '{depth_model}': {e}")
             self.depth_pipe = None
 
-        # 2. Initialize SOTA Edge Model
+        # 2. Initialize SOTA Edge Model (PiDiNet)
         try:
-            self.edge_pipe = pipeline(
-                task="image-segmentation",
-                model=edge_model,
-                device=self.device,
-                trust_remote_code=True,
+            # Point this to the exact path where you curled the .pth file
+            model_path = ANNOTATORS_DIR / "pidinet_cg0.11_nc.pth"
+
+            # Load the custom neural annotator
+            self.edge_pipe = PidiNetDetector.from_pretrained(
+                "lllyasviel/Annotators",
+                filename="pidinet_cg0.11_nc.pth",
+                cache_dir=ANNOTATORS_DIR,
             )
-            logger.info(f"Edge model '{edge_model}' loaded successfully.")
+            logger.info("PiDiNet Edge model loaded successfully.")
         except Exception as e:
-            logger.warning(
-                f"Could not load custom edge model '{edge_model}'. Error: {e}"
-            )
-            self.edge_pipe = None  # Ensure the attribute exists even if it fails
+            logger.warning(f"Could not load custom edge model. Error: {e}")
+            self.edge_pipe = None
 
     @staticmethod
     def _get_optimal_device() -> str:
