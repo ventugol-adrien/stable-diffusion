@@ -1,6 +1,10 @@
 import base64
 from contextlib import asynccontextmanager
 import io, os, json, time
+
+from matplotlib import image
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 from random import randint
 from pathlib import Path
 import zipfile
@@ -17,11 +21,13 @@ from diffusers import (
 )
 from PIL import Image, ImageOps
 from diffusers import AutoPipelineForImage2Image
-from PIL import Image
+from diffusers.utils import export_to_video
 
 from src.pipeline import (
     get_pipe,
     get_fast_pipe,
+    get_flux2_pipe,
+    get_video_pipe,
     warmup_pipeline,
     generate_image,
     shutdown,
@@ -29,6 +35,7 @@ from src.pipeline import (
 )
 from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
+from src.models import VideoRequest
 
 from src.controlnet import router as depthmap_router
 
@@ -91,7 +98,47 @@ app.include_router(loras_router)
 def handle_generate_image(request: ImageRequest):
     breakdown = {}
     start_time = time.monotonic()
+    is_flux2 = request.model.startswith("flux2")
 
+    # --- FLUX2 PATH ---
+    if is_flux2:
+        pipe = get_flux2_pipe(request.model)
+        t_to_pipeline = time.monotonic() - start_time
+        breakdown["pipeline_load_time"] = t_to_pipeline
+
+        positive_prompt, _ = process_prompt(request.user_input)
+
+        t0 = time.monotonic()
+        images = generate_image(
+            pipe=pipe,
+            prompt=positive_prompt,
+            num_inference_steps=50,
+            guidance_scale=4.0,
+            height=1024,
+            width=1024,
+            num_images_per_prompt=request.batch_size,
+        )
+        breakdown["generation_time"] = time.monotonic() - t0
+
+        latency = time.monotonic() - start_time
+        throughput = request.batch_size / latency if latency > 0 else 0
+
+        zip_buffer = io.BytesIO()
+        metrics = {"latency": latency, "throughput": throughput, "breakdown": breakdown}
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr("metrics.json", json.dumps(metrics))
+            for i, img in enumerate(images):
+                img_buffer = io.BytesIO()
+                img.save(img_buffer, format="PNG")
+                zip_file.writestr(f"image_{i}.png", img_buffer.getvalue())
+
+        return Response(
+            content=zip_buffer.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=results.zip"},
+        )
+
+    # --- SDXL PATH ---
     pipe = (
         get_fast_pipe(request.model) if request.lightning else get_pipe(request.model)
     )
@@ -200,6 +247,7 @@ def handle_generate_image(request: ImageRequest):
             ip_adapter_image = Image.open(io.BytesIO(ip_adapter_image_bytes)).convert(
                 "RGB"
             )
+
             pipe.load_ip_adapter(
                 "h94/IP-Adapter",
                 subfolder="sdxl_models",
@@ -246,6 +294,48 @@ def handle_generate_image(request: ImageRequest):
             "Content-Disposition": "attachment; filename=results.zip",
         },
     )
+
+
+@app.post("/generate/video")
+async def generate_image_to_video(request: VideoRequest):
+    pipeline = get_video_pipe()
+
+    try:
+        init_image = Image.open(io.BytesIO(base64.b64decode(request.image[0]))).convert(
+            "RGB"
+        )
+        generator = torch.manual_seed(42)
+
+        # Generate the video latents and decode them
+        video = pipeline(
+            prompt=request.prompt,
+            negative_prompt=request.negative_prompt,
+            image=init_image,
+            num_frames=request.num_frames,
+            num_inference_steps=request.num_inference_steps,
+            generator=generator,
+            output_type="pt",  # Output as PyTorch tensors for efficient saving
+        ).frames
+
+        # ---------------------------------------------------------
+        # 4. Export and Response
+        # ---------------------------------------------------------
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+
+        filename = f"ltx_i2v_{time.time()}.mp4"
+        output_path = os.path.join(output_dir, filename)
+
+        # Export tensor to mp4 at 25 FPS
+        export_to_video(video, output_path, fps=25)
+
+        return FileResponse(path=output_path, media_type="video/mp4", filename=filename)
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/models")

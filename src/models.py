@@ -23,3 +23,11 @@ class ImageRequest(BaseModel):
     image_seed: int = -1
     prompt_seed: int = -1
     batch_size: int = 1
+
+
+class VideoRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = "worst quality, distorted, blurry, watermark"
+    num_frames: int = 30  # 25 frames = 1 second at 25fps
+    num_inference_steps: int = 40  # 40 steps is optimal for LTX
+    image: list[str]
