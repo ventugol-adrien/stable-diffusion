@@ -1,3 +1,5 @@
 .env
 caches/
 __pycache__/
+test.py
+*.png

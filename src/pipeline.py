@@ -18,7 +18,10 @@ VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
 CWD = Path(os.getcwd())
 MODEL_CACHE_DIR = CWD / "caches" / "models"
 WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
+MODELS_DIR = Path.home() / "sd_models"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 def cleanup_resources():
@@ -63,9 +66,12 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
         print(f"⚡ Loading from diffusers cache: {cached_dir}")
         t0 = time.monotonic()
         pipe = StableDiffusionXLPipeline.from_pretrained(
-            cached_dir, torch_dtype=DTYPE, use_safetensors=True
+            cached_dir,
+            torch_dtype=DTYPE,
+            use_safetensors=True,
+            attn_implementation="flash_attention_2",
         )
-        print(f"   Loaded in {time.monotonic() - t0:.1f}s (cached)")
+        print(f"   Loaded in {time.monotonic() - t0:.1f}s (cached, flash_attn)")
         return pipe
 
     # SLOW PATH: first-time load from single .safetensors file
@@ -82,8 +88,9 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
         torch_dtype=DTYPE,
         use_safetensors=True,
         variant="fp16",
+        attn_implementation="flash_attention_2",
     )
-    print(f"   Loaded in {time.monotonic() - t0:.1f}s")
+    print(f"   Loaded in {time.monotonic() - t0:.1f}s (flash_attn)")
 
     # Save as diffusers format for faster future loads
     print(f"💾 Caching as diffusers format: {cached_dir}")
@@ -106,40 +113,26 @@ def get_pipe(model: str = "juggernaut"):
         print("🔄 Switching pipeline/model. Clearing VRAM...")
         cleanup_resources()
 
-    print(f"🚀 Initializing Optimized Pipeline for RDNA4 (gfx1200)...")
+    print(f"🚀 Initializing Optimized Pipeline for L40S (Ada Lovelace)...")
 
     pipe = _load_pipeline(model)
-    # 3. CRITICAL VRAM OPTIMIZATIONS
-    # VAE Tiling splits the image into chunks for decoding.
-    # This keeps peak memory usage low, preventing OOM and avoiding
-    # the deadly swap-to-CPU behavior that crashes Linux 6.14 amdkfd.[20]
-    print("🧩 Enabling VAE Tiling (Tile Size: 512)...")
-    pipe.vae.enable_tiling()
-
-    # Enable Slicing for further memory savings during batch processing
-    pipe.vae.enable_slicing()
+    pipe.enable_freeu(
+        s1=0.9,  # Skip connection scaling factor for stage 1
+        s2=0.2,  # Skip connection scaling factor for stage 2
+        b1=1.3,  # Backbone scaling factor for stage 1
+        b2=1.4,  # Backbone scaling factor for stage 2
+    )
 
     # 4. SCHEDULER OPTIMIZATION
     # Euler Ancestral is fast and widely compatible.
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
 
     # 5. MEMORY EFFICIENT ATTENTION
-    # Since we enabled the Triton flag above, we try to use Scaled Dot Product Attention (SDP)
-    # which is PyTorch's native fast attention (Flash Attention equivalent).
-    print("🔥 Pipeline Ready. Using Native SDPA (Flash Attention equivalent).")
+    # FlashAttention 2 is enabled at model load time via attn_implementation="flash_attention_2"
+    print("🔥 Pipeline Ready. Using FlashAttention 2.")
 
     # 6. TRANSFER TO GPU
-    # We rely on the env vars to handle the allocation strategy.
     pipe.to("cuda")
-    # pipe.load_ip_adapter(
-    #     "h94/IP-Adapter", subfolder="sdxl_models", weight_name="ip-adapter_sdxl.bin"
-    # )
-    # pipe.set_ip_adapter_scale(0.8)
-
-    # pipe.unet = torch.compile(pipe.unet, mode="default",dynamic=True)
-
-    # Optional: Compile VAE decode (smaller speedup, but helps)
-    # pipe.vae.decode = torch.compile(pipe.vae.decode, mode="default",dynamic=True)
 
     _cached_pipe = pipe
     _cached_model_name = model
@@ -219,10 +212,20 @@ def warmup_pipeline(
 
 
 def generate_image(pipe, **kwargs):
-    real_image_seed = kwargs.get("image_seed", -1)
-    if real_image_seed == -1:
-        real_image_seed = randint(0, 2**32 - 1)
-    kwargs["image_seed"] = real_image_seed
+    """
+    Safely intercepts integer seeds and converts them to Diffusers-compatible Generators.
+    """
+    # Extract the custom seed integer, default to random if not provided
+    seed = kwargs.pop("seed", -1)
+    if seed == -1:
+        seed = randint(0, 2**32 - 1)
+
+    print(f"🎲 Generating with seed: {seed}")
+
+    # Diffusers requires a torch.Generator object for deterministic noise
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    kwargs["generator"] = generator
+
     return pipe(**kwargs).images
 
 

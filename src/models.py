@@ -14,6 +14,9 @@ class ImageRequest(BaseModel):
     strength: float = None
     reference: str = None
     depthmap: str = None
+    depth_scales: list[float] = []
+    canny_edges: str = None
+    edges_scales: list[float] = []
     ip_adapter_scale: float = None
     ip_adapter_image: str = None
     lightning: bool = False

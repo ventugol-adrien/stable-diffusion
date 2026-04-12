@@ -4,8 +4,8 @@ import io, os, json, time
 from random import randint
 from pathlib import Path
 import zipfile
-from fastapi import FastAPI
-from fastapi.responses import Response, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.models import ImageRequest
 from compel import CompelForSDXL
@@ -27,7 +27,7 @@ from src.pipeline import (
     shutdown,
     MODEL_CACHE_DIR,
 )
-from src.loras import add_loras, record_lora_config
+from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
 
 from src.controlnet import router as depthmap_router
@@ -84,6 +84,7 @@ app.add_middleware(
 )
 
 app.include_router(depthmap_router)
+app.include_router(loras_router)
 
 
 @app.post("/generate/image")
@@ -133,18 +134,66 @@ def handle_generate_image(request: ImageRequest):
         init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
         pipe = AutoPipelineForImage2Image.from_pipe(pipe)
 
+    # 1. Initialize dynamic lists for Multi-ControlNet
+    controlnets = []
+    control_images = []
+    control_scales = []
+
+    # 2. Process Depth Prior (Xinsir SOTA)
     if request.depthmap:
-        print("🕳️ Depth map provided, applying ControlNet conditioning...")
-        depthmap_bytes = base64.b64decode(request.depthmap)
-        init_image = Image.open(io.BytesIO(depthmap_bytes)).convert("RGB")
-        controlnet = ControlNetModel.from_pretrained(
-            "diffusers/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16
-        ).to("cuda")
+        print("🕳️ Depth map provided, loading Xinsir Depth ControlNet...")
+        depthmap_data = request.depthmap
+        if "," in depthmap_data:
+            depthmap_data = depthmap_data.split(",")[1]
+        depthmap_bytes = base64.b64decode(depthmap_data)
+        depthmap_img = Image.open(io.BytesIO(depthmap_bytes)).convert("RGB")
+        depthmap_img = ImageOps.fit(depthmap_img, (1024, 1024), method=Image.LANCZOS)
+        control_images.append(depthmap_img)
+        controlnets.append(
+            ControlNetModel.from_pretrained(
+                "xinsir/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16
+            )
+        )
+        control_scales.append(
+            request.depth_scales[0] if request.depth_scales else 0.5
+        )  # Default weight for structural depth
+
+    # 3. Process Canny Prior (Xinsir SOTA)
+    if request.canny_edges:
+        print("✏️ Canny map provided, loading Xinsir Canny ControlNet...")
+        canny_data = request.canny_edges
+        if "," in canny_data:
+            canny_data = canny_data.split(",")[1]
+        canny_bytes = base64.b64decode(canny_data)
+        canny_img = Image.open(io.BytesIO(canny_bytes)).convert("RGB")
+        canny_img = ImageOps.fit(canny_img, (1024, 1024), method=Image.LANCZOS)
+        control_images.append(canny_img)
+        controlnets.append(
+            ControlNetModel.from_pretrained(
+                "xinsir/controlnet-canny-sdxl-1.0", torch_dtype=torch.float16
+            )
+        )
+        control_scales.append(
+            request.edges_scales[0] if request.edges_scales else 0.4
+        )  # Default weight for fine edge details
+
+    # 4. Initialize Pipeline if any spatial priors exist
+    if controlnets:
+        print(f"🚀 Initializing SDXL Pipeline with {len(controlnets)} ControlNet(s)...")
+
+        # The Diffusers pipeline natively accepts a list of ControlNet models
         pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             MODEL_CACHE_DIR / request.model,
-            controlnet=controlnet,
+            controlnet=controlnets,
             torch_dtype=torch.float16,
+            attn_implementation="flash_attention_2",
         ).to("cuda")
+
+        # Note: During the actual generation call (pipe(...)), you MUST pass:
+        # image=control_images
+        # controlnet_conditioning_scale=control_scales
+
+        # 5. IP-Adapter Integration
         if request.ip_adapter_image and request.ip_adapter_scale:
             print("🧩 IP-Adapter image and scale provided, adding to pipeline...")
             ip_adapter_image_bytes = base64.b64decode(request.ip_adapter_image)
@@ -155,7 +204,6 @@ def handle_generate_image(request: ImageRequest):
                 "h94/IP-Adapter",
                 subfolder="sdxl_models",
                 weight_name="ip-adapter_sdxl.bin",
-                force_download=True,
             )
             pipe.set_ip_adapter_scale(request.ip_adapter_scale)
 
@@ -165,17 +213,14 @@ def handle_generate_image(request: ImageRequest):
         pooled_prompt_embeds=conditioning.pooled_embeds,
         negative_prompt_embeds=conditioning.negative_embeds,
         negative_pooled_prompt_embeds=conditioning.negative_pooled_embeds,
-        image=init_image,
-        strength=request.strength if request.strength is not None else 0.6,
+        image=control_images if control_images else None,
+        controlnet_conditioning_scale=control_scales if control_scales else None,
         num_inference_steps=8 if request.lightning else 30,
-        cfg=1.5 if request.lightning else 7.0,
+        guidance_scale=1.5 if request.lightning else 7.0,  # Fixed from 'cfg'
         height=1024,
         width=1024,
         num_images_per_prompt=request.batch_size,
-        ip_adapter_image=(
-            ip_adapter_image if (ip_adapter_image := request.ip_adapter_image) else None
-        ),
-        ip_adapter_scale=request.ip_adapter_scale if request.ip_adapter_scale else None,
+        ip_adapter_image=ip_adapter_image if request.ip_adapter_image else None,
     )
     t_to_generation = time.monotonic() - t_to_prompt
     breakdown["generation_time"] = t_to_generation
