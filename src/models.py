@@ -7,6 +7,14 @@ class LoRA(BaseModel):
     scale: float = 0.5
 
 
+class DivergentSpace(BaseModel):
+    depthmap: str = None
+    depthmap_scale: float = None
+    canny_edges: str = None
+    edges_scale: float = None
+    scale: float = 0.5
+
+
 class ImageRequest(BaseModel):
     user_input: str
     loras: list[LoRA] = []
@@ -17,6 +25,7 @@ class ImageRequest(BaseModel):
     depth_scales: list[float] = []
     canny_edges: str = None
     edges_scales: list[float] = []
+    divergent_spaces: list[DivergentSpace] = []
     ip_adapter_scale: float = None
     ip_adapter_image: str = None
     lightning: bool = False

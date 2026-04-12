@@ -177,7 +177,79 @@ def handle_generate_image(request: ImageRequest):
             request.edges_scales[0] if request.edges_scales else 0.4
         )  # Default weight for fine edge details
 
-    # 4. Initialize Pipeline if any spatial priors exist
+    # 4. Process Divergent Spaces (Heterogeneous Control Batching)
+    if request.divergent_spaces:
+        if len(request.divergent_spaces) != request.batch_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Number of divergent spaces ({len(request.divergent_spaces)}) must match batch size ({request.batch_size}).",
+            )
+        print(
+            f"🌌 Divergent Spaces provided. Pre-computing sparse tensors for batch size {request.batch_size}..."
+        )
+        import torchvision.transforms.functional as TF
+
+        batch_size = request.batch_size
+        has_depth = any(ds.depthmap for ds in request.divergent_spaces)
+        has_canny = any(ds.canny_edges for ds in request.divergent_spaces)
+
+        if has_depth:
+            depth_tensor = torch.zeros(
+                (batch_size, 3, 1024, 1024), device="cuda", dtype=torch.float16
+            )
+            active_depth_scale = 0.5
+            for i in range(batch_size):
+                space = request.divergent_spaces[i]
+                if space.depthmap:
+                    raw_data = space.depthmap
+                    if "," in raw_data:
+                        raw_data = raw_data.split(",")[1]
+                    img_bytes = base64.b64decode(raw_data)
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    img = ImageOps.fit(img, (1024, 1024), method=Image.LANCZOS)
+                    img_tensor = TF.to_tensor(img).to(
+                        device="cuda", dtype=torch.float16
+                    )
+                    depth_tensor[i] = img_tensor
+                    if space.depthmap_scale is not None:
+                        active_depth_scale = space.depthmap_scale
+            controlnets.append(
+                ControlNetModel.from_pretrained(
+                    "xinsir/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16
+                )
+            )
+            control_images.append(depth_tensor)
+            control_scales.append(active_depth_scale)
+
+        if has_canny:
+            canny_tensor = torch.zeros(
+                (batch_size, 3, 1024, 1024), device="cuda", dtype=torch.float16
+            )
+            active_canny_scale = 0.4
+            for i in range(batch_size):
+                space = request.divergent_spaces[i]
+                if space.canny_edges:
+                    raw_data = space.canny_edges
+                    if "," in raw_data:
+                        raw_data = raw_data.split(",")[1]
+                    img_bytes = base64.b64decode(raw_data)
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    img = ImageOps.fit(img, (1024, 1024), method=Image.LANCZOS)
+                    img_tensor = TF.to_tensor(img).to(
+                        device="cuda", dtype=torch.float16
+                    )
+                    canny_tensor[i] = img_tensor
+                    if space.edges_scale is not None:
+                        active_canny_scale = space.edges_scale
+            controlnets.append(
+                ControlNetModel.from_pretrained(
+                    "xinsir/controlnet-canny-sdxl-1.0", torch_dtype=torch.float16
+                )
+            )
+            control_images.append(canny_tensor)
+            control_scales.append(active_canny_scale)
+
+    # 5. Initialize Pipeline if any spatial priors exist
     if controlnets:
         print(f"🚀 Initializing SDXL Pipeline with {len(controlnets)} ControlNet(s)...")
 
