@@ -31,6 +31,7 @@ from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
 
 from src.controlnet import router as depthmap_router
+from src.video import router as video_router
 
 import torch
 
@@ -85,6 +86,7 @@ app.add_middleware(
 
 app.include_router(depthmap_router)
 app.include_router(loras_router)
+app.include_router(video_router)
 
 
 @app.post("/generate/image")
