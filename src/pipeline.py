@@ -69,7 +69,6 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
             cached_dir,
             torch_dtype=DTYPE,
             use_safetensors=True,
-            attn_implementation="flash_attention_2",
         )
         print(f"   Loaded in {time.monotonic() - t0:.1f}s (cached, flash_attn)")
         return pipe
@@ -88,7 +87,6 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
         torch_dtype=DTYPE,
         use_safetensors=True,
         variant="fp16",
-        attn_implementation="flash_attention_2",
     )
     print(f"   Loaded in {time.monotonic() - t0:.1f}s (flash_attn)")
 
@@ -128,8 +126,8 @@ def get_pipe(model: str = "juggernaut"):
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
 
     # 5. MEMORY EFFICIENT ATTENTION
-    # FlashAttention 2 is enabled at model load time via attn_implementation="flash_attention_2"
-    print("🔥 Pipeline Ready. Using FlashAttention 2.")
+    # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)
+    print("🔥 Pipeline Ready. Using FlashAttention 2 (via PyTorch SDPA).")
 
     # 6. TRANSFER TO GPU
     pipe.to("cuda")
@@ -229,4 +227,9 @@ def generate_image(pipe, **kwargs):
     return pipe(**kwargs).images
 
 
-def shutdown(): ...
+def shutdown():
+    """
+    Cleanly releases all VRAM resources. Should be called on application exit.
+    """
+    print("🛑 Shutting down pipeline and releasing resources...")
+    cleanup_resources()

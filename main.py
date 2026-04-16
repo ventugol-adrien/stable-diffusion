@@ -4,15 +4,15 @@ import io, os, json, time
 from random import randint
 from pathlib import Path
 import zipfile
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.models import ImageRequest
 from compel import CompelForSDXL
 from diffusers import (
     AutoPipelineForImage2Image,
-    StableDiffusionUpscalePipeline,
     StableDiffusionXLControlNetPipeline,
+    StableDiffusionXLControlNetInpaintPipeline,
     ControlNetModel,
 )
 from PIL import Image, ImageOps
@@ -88,7 +88,7 @@ app.include_router(loras_router)
 
 
 @app.post("/generate/image")
-def handle_generate_image(request: ImageRequest):
+def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form)):
     breakdown = {}
     start_time = time.monotonic()
 
@@ -117,20 +117,8 @@ def handle_generate_image(request: ImageRequest):
     init_image = None
     if request.reference:
         print("🖼️ Reference image provided, preparing for img2img generation...")
-        init_image = request.reference
-        if "," in init_image:
-            # Split at the comma and keep only the actual data portion
-            init_image = init_image.split(",")[1]
-        image_bytes = base64.b64decode(init_image)
-        init_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        init_image = Image.open(request.reference.file).convert("RGB")
 
-        if init_image.width < 1024 or init_image.height < 1024:
-            upscale_pipe = StableDiffusionUpscalePipeline.from_pretrained(
-                "stabilityai/stable-diffusion-x4-upscaler", torch_dtype=torch.float16
-            ).to("cuda")
-            init_image = upscale_pipe(prompt=positive_prompt, image=init_image).images[
-                0
-            ]
         init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
         pipe = AutoPipelineForImage2Image.from_pipe(pipe)
 
@@ -142,11 +130,7 @@ def handle_generate_image(request: ImageRequest):
     # 2. Process Depth Prior (Xinsir SOTA)
     if request.depthmap:
         print("🕳️ Depth map provided, loading Xinsir Depth ControlNet...")
-        depthmap_data = request.depthmap
-        if "," in depthmap_data:
-            depthmap_data = depthmap_data.split(",")[1]
-        depthmap_bytes = base64.b64decode(depthmap_data)
-        depthmap_img = Image.open(io.BytesIO(depthmap_bytes)).convert("RGB")
+        depthmap_img = Image.open(request.depthmap.file).convert("RGB")
         depthmap_img = ImageOps.fit(depthmap_img, (1024, 1024), method=Image.LANCZOS)
         control_images.append(depthmap_img)
         controlnets.append(
@@ -161,11 +145,7 @@ def handle_generate_image(request: ImageRequest):
     # 3. Process Canny Prior (Xinsir SOTA)
     if request.canny_edges:
         print("✏️ Canny map provided, loading Xinsir Canny ControlNet...")
-        canny_data = request.canny_edges
-        if "," in canny_data:
-            canny_data = canny_data.split(",")[1]
-        canny_bytes = base64.b64decode(canny_data)
-        canny_img = Image.open(io.BytesIO(canny_bytes)).convert("RGB")
+        canny_img = Image.open(request.canny_edges.file).convert("RGB")
         canny_img = ImageOps.fit(canny_img, (1024, 1024), method=Image.LANCZOS)
         control_images.append(canny_img)
         controlnets.append(
@@ -178,6 +158,11 @@ def handle_generate_image(request: ImageRequest):
         )  # Default weight for fine edge details
 
     # 4. Process Divergent Spaces (Heterogeneous Control Batching)
+    has_mask_in_divergent = False
+    reference_tensor = None
+    mask_tensor = None
+    active_mask_strength = 1.0
+
     if request.divergent_spaces:
         if len(request.divergent_spaces) != request.batch_size:
             raise HTTPException(
@@ -192,21 +177,34 @@ def handle_generate_image(request: ImageRequest):
         batch_size = request.batch_size
         has_depth = any(ds.depthmap for ds in request.divergent_spaces)
         has_canny = any(ds.canny_edges for ds in request.divergent_spaces)
+        has_mask_in_divergent = any(ds.mask for ds in request.divergent_spaces)
+
+        target_width, target_height = 1024, 1024
+        if has_mask_in_divergent:
+            for ds in request.divergent_spaces:
+                if ds.mask and ds.reference:
+                    ref_img = Image.open(ds.reference.file).convert("RGB")
+                    target_width = ref_img.width - (ref_img.width % 8)
+                    target_height = ref_img.height - (ref_img.height % 8)
+                    break
 
         if has_depth:
             depth_tensor = torch.zeros(
-                (batch_size, 3, 1024, 1024), device="cuda", dtype=torch.float16
+                (batch_size, 3, target_height, target_width),
+                device="cuda",
+                dtype=torch.float16,
             )
             active_depth_scale = 0.5
             for i in range(batch_size):
                 space = request.divergent_spaces[i]
                 if space.depthmap:
-                    raw_data = space.depthmap
-                    if "," in raw_data:
-                        raw_data = raw_data.split(",")[1]
-                    img_bytes = base64.b64decode(raw_data)
-                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    img = ImageOps.fit(img, (1024, 1024), method=Image.LANCZOS)
+                    img = Image.open(space.depthmap.file).convert("RGB")
+                    if has_mask_in_divergent:
+                        img = ImageOps.fit(
+                            img, (target_width, target_height), method=Image.LANCZOS
+                        )
+                    else:
+                        img = ImageOps.fit(img, (1024, 1024), method=Image.LANCZOS)
                     img_tensor = TF.to_tensor(img).to(
                         device="cuda", dtype=torch.float16
                     )
@@ -223,18 +221,21 @@ def handle_generate_image(request: ImageRequest):
 
         if has_canny:
             canny_tensor = torch.zeros(
-                (batch_size, 3, 1024, 1024), device="cuda", dtype=torch.float16
+                (batch_size, 3, target_height, target_width),
+                device="cuda",
+                dtype=torch.float16,
             )
             active_canny_scale = 0.4
             for i in range(batch_size):
                 space = request.divergent_spaces[i]
                 if space.canny_edges:
-                    raw_data = space.canny_edges
-                    if "," in raw_data:
-                        raw_data = raw_data.split(",")[1]
-                    img_bytes = base64.b64decode(raw_data)
-                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    img = ImageOps.fit(img, (1024, 1024), method=Image.LANCZOS)
+                    img = Image.open(space.canny_edges.file).convert("RGB")
+                    if has_mask_in_divergent:
+                        img = ImageOps.fit(
+                            img, (target_width, target_height), method=Image.LANCZOS
+                        )
+                    else:
+                        img = ImageOps.fit(img, (1024, 1024), method=Image.LANCZOS)
                     img_tensor = TF.to_tensor(img).to(
                         device="cuda", dtype=torch.float16
                     )
@@ -249,17 +250,56 @@ def handle_generate_image(request: ImageRequest):
             control_images.append(canny_tensor)
             control_scales.append(active_canny_scale)
 
+        if has_mask_in_divergent:
+            mask_tensor = torch.ones(
+                (batch_size, 1, target_height, target_width),
+                device="cuda",
+                dtype=torch.float16,
+            )
+            reference_tensor = torch.zeros(
+                (batch_size, 3, target_height, target_width),
+                device="cuda",
+                dtype=torch.float16,
+            )
+            for i in range(batch_size):
+                space = request.divergent_spaces[i]
+                if space.mask and space.reference:
+                    mask_img = Image.open(space.mask.file).convert("L")
+                    mask_img = ImageOps.fit(
+                        mask_img, (target_width, target_height), method=Image.LANCZOS
+                    )
+                    mask_tensor[i] = TF.to_tensor(mask_img).to(
+                        device="cuda", dtype=torch.float16
+                    )
+
+                    ref_img = Image.open(space.reference.file).convert("RGB")
+                    ref_img = ImageOps.fit(
+                        ref_img, (target_width, target_height), method=Image.LANCZOS
+                    )
+                    reference_tensor[i] = TF.to_tensor(ref_img).to(
+                        device="cuda", dtype=torch.float16
+                    )
+
+                    if space.mask_strength is not None:
+                        active_mask_strength = space.mask_strength
+
     # 5. Initialize Pipeline if any spatial priors exist
     if controlnets:
         print(f"🚀 Initializing SDXL Pipeline with {len(controlnets)} ControlNet(s)...")
 
         # The Diffusers pipeline natively accepts a list of ControlNet models
-        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-            MODEL_CACHE_DIR / request.model,
-            controlnet=controlnets,
-            torch_dtype=torch.float16,
-            attn_implementation="flash_attention_2",
-        ).to("cuda")
+        if has_mask_in_divergent:
+            pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+                MODEL_CACHE_DIR / request.model,
+                controlnet=controlnets,
+                torch_dtype=torch.float16,
+            ).to("cuda")
+        else:
+            pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+                MODEL_CACHE_DIR / request.model,
+                controlnet=controlnets,
+                torch_dtype=torch.float16,
+            ).to("cuda")
 
         # Note: During the actual generation call (pipe(...)), you MUST pass:
         # image=control_images
@@ -268,10 +308,7 @@ def handle_generate_image(request: ImageRequest):
         # 5. IP-Adapter Integration
         if request.ip_adapter_image and request.ip_adapter_scale:
             print("🧩 IP-Adapter image and scale provided, adding to pipeline...")
-            ip_adapter_image_bytes = base64.b64decode(request.ip_adapter_image)
-            ip_adapter_image = Image.open(io.BytesIO(ip_adapter_image_bytes)).convert(
-                "RGB"
-            )
+            ip_adapter_image = Image.open(request.ip_adapter_image.file).convert("RGB")
             pipe.load_ip_adapter(
                 "h94/IP-Adapter",
                 subfolder="sdxl_models",
@@ -279,21 +316,49 @@ def handle_generate_image(request: ImageRequest):
             )
             pipe.set_ip_adapter_scale(request.ip_adapter_scale)
 
-    images = generate_image(
-        pipe=pipe,
-        prompt_embeds=conditioning.embeds,
-        pooled_prompt_embeds=conditioning.pooled_embeds,
-        negative_prompt_embeds=conditioning.negative_embeds,
-        negative_pooled_prompt_embeds=conditioning.negative_pooled_embeds,
-        image=control_images if control_images else None,
-        controlnet_conditioning_scale=control_scales if control_scales else None,
-        num_inference_steps=8 if request.lightning else 30,
-        guidance_scale=1.5 if request.lightning else 7.0,  # Fixed from 'cfg'
-        height=1024,
-        width=1024,
-        num_images_per_prompt=request.batch_size,
-        ip_adapter_image=ip_adapter_image if request.ip_adapter_image else None,
-    )
+    # When ControlNets are active with batch_size > 1, the control image tensors
+    # already carry the batch dimension. Expand prompt embeds to match and set
+    # num_images_per_prompt=1 so diffusers' check_inputs won't reject the mismatch.
+    prompt_embeds = conditioning.embeds
+    pooled_prompt_embeds = conditioning.pooled_embeds
+    negative_prompt_embeds = conditioning.negative_embeds
+    negative_pooled_prompt_embeds = conditioning.negative_pooled_embeds
+    num_images = request.batch_size
+    if control_images and batch_size > 1:
+        prompt_embeds = prompt_embeds.repeat(batch_size, 1, 1)
+        pooled_prompt_embeds = pooled_prompt_embeds.repeat(batch_size, 1)
+        negative_prompt_embeds = negative_prompt_embeds.repeat(batch_size, 1, 1)
+        negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(
+            batch_size, 1
+        )
+        num_images = 1
+
+    gen_kwargs = {
+        "pipe": pipe,
+        "prompt_embeds": prompt_embeds,
+        "pooled_prompt_embeds": pooled_prompt_embeds,
+        "negative_prompt_embeds": negative_prompt_embeds,
+        "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+        "controlnet_conditioning_scale": control_scales if control_scales else None,
+        "num_inference_steps": 8 if request.lightning else 30,
+        "guidance_scale": 1.5 if request.lightning else 7.0,  # Fixed from 'cfg'
+        "height": target_height if "target_height" in locals() else 1024,
+        "width": target_width if "target_width" in locals() else 1024,
+        "num_images_per_prompt": num_images,
+        "ip_adapter_image": ip_adapter_image if request.ip_adapter_image else None,
+        "control_guidance_end_step": 0.5,
+    }
+
+    if has_mask_in_divergent:
+        gen_kwargs["image"] = reference_tensor
+        gen_kwargs["mask_image"] = mask_tensor
+        gen_kwargs["control_image"] = control_images if control_images else None
+        gen_kwargs["strength"] = active_mask_strength
+    else:
+        gen_kwargs["image"] = control_images if control_images else None
+
+    images = generate_image(**gen_kwargs)
+
     t_to_generation = time.monotonic() - t_to_prompt
     breakdown["generation_time"] = t_to_generation
     # record_lora_config(request.model, request.loras)
@@ -301,9 +366,23 @@ def handle_generate_image(request: ImageRequest):
     latency = time.monotonic() - start_time
     throughput = request.batch_size / latency if latency > 0 else 0
 
-    zip_buffer = io.BytesIO()
     metrics = {"latency": latency, "throughput": throughput, "breakdown": breakdown}
 
+    if len(images) == 1:
+        img_buffer = io.BytesIO()
+        images[0].save(img_buffer, format="PNG")
+        return Response(
+            content=img_buffer.getvalue(),
+            media_type="image/png",
+            headers={
+                "Content-Disposition": "inline; filename=result.png",
+                "X-Metrics-Latency": str(latency),
+                "X-Metrics-Throughput": str(throughput),
+                "X-Metrics-Breakdown": json.dumps(breakdown),
+            },
+        )
+
+    zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         zip_file.writestr("metrics.json", json.dumps(metrics))
         for i, img in enumerate(images):
