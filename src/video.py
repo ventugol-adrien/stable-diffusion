@@ -1,4 +1,4 @@
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from src.controlnet import ControlNetAssetGenerator
 from src.pipeline import cleanup_resources
@@ -12,6 +12,8 @@ import zipfile
 import tempfile
 import shutil
 import os
+from pathlib import Path
+import re
 import torch
 
 # Disable xet download backend — crashes with "Background writer channel closed"
@@ -22,42 +24,200 @@ logging.basicConfig(level=logging.INFO)
 
 router = APIRouter(prefix="/generate", tags=["video"])
 
-# ── Wan 2.2 constants ─────────────────────────────────────────────────────────
+# ── Wan 2.2 A14B MoE constants ────────────────────────────────────────────────
 
-_WAN_T2V_REPO = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
-_WAN_I2V_REPO = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
-_DISTILL_LORA_REPO = "lightx2v/Wan2.1-Distill-Loras"
-_DISTILL_LORA_I2V = "wan2.1_i2v_lora_rank64_lightx2v_4step.safetensors"
-_DISTILL_STEPS = [1000, 750, 500, 250]
-_CACHES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "caches")
-_WAN_T2V_LOCAL_CACHE = os.path.join(_CACHES_DIR, "wan-t2v-1.3b")
-_WAN_I2V_LOCAL_CACHE = os.path.join(_CACHES_DIR, "wan-i2v-14b-4bit")
+_WAN_T2V_REPO = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+_WAN_I2V_REPO = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+
+# ── Distill tuning knobs ──────────────────────────────────────────────────────
+_DISTILL_NUM_STEPS = 8  # number of denoising steps in distill mode
+_DISTILL_LORA_WEIGHT_HIGH = 1.0  # LoRA weight for high-noise expert (transformer)
+_DISTILL_LORA_WEIGHT_LOW = 1.0  # LoRA weight for low-noise expert (transformer_2)
+_BOUNDARY_RATIO = 0.5  # MoE expert switch point (0.5 = 50/50 split)
+
+# Evenly-spaced sigma timesteps derived from step count (e.g. 8 -> [1000,875,...,125])
+_DISTILL_STEPS = [
+    int(1000 - i * (1000 / _DISTILL_NUM_STEPS)) for i in range(_DISTILL_NUM_STEPS)
+]
+
+# ── LoRA directory + registry ─────────────────────────────────────────────────────
+# Local: loras/i2v/<name>/high.safetensors + low.safetensors
+# Registry: fallback for HuggingFace-hosted LoRAs
+_LORA_DIR = Path(__file__).resolve().parent.parent / "loras"
+_LORA_REGISTRY = {
+    "distill": {
+        "repo": "lightx2v/Wan2.2-Distill-Loras",
+        "t2v_high": "wan2.2_t2v_A14b_high_noise_lora_rank64_lightx2v_4step_1217.safetensors",
+        "t2v_low": "wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors",
+        "i2v_high": "wan2.2_i2v_A14b_high_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+        "i2v_low": "wan2.2_i2v_A14b_low_noise_lora_rank64_lightx2v_4step_1022.safetensors",
+    },
+}
+
+_CACHES_DIR = Path(__file__).resolve().parent.parent / "caches"
+_WAN_T2V_LOCAL_CACHE = _CACHES_DIR / "wan-t2v-a14b-4bit"
+_WAN_I2V_LOCAL_CACHE = _CACHES_DIR / "wan-i2v-a14b-4bit"
 
 _wan_t2v_pipe = None
 _wan_i2v_pipe = None
 
 
+def _parse_lora_params(form) -> list[dict]:
+    """Parse loras.N.name / loras.N.weight_high / loras.N.weight_low from multipart form."""
+    lora_fields: dict[int, dict] = {}
+    for key in form:
+        m = re.match(r"loras\.(\d+)\.(\w+)", key)
+        if m:
+            idx, field = int(m.group(1)), m.group(2)
+            lora_fields.setdefault(idx, {})[field] = form[key]
+    loras = []
+    for idx in sorted(lora_fields):
+        entry = lora_fields[idx]
+        if "name" not in entry:
+            continue
+        loras.append(
+            {
+                "name": str(entry["name"]),
+                "weight_high": float(entry.get("weight_high", 1.0)),
+                "weight_low": float(entry.get("weight_low", 1.0)),
+            }
+        )
+    return loras
+
+
+def _ensure_lora_loaded(pipe, name: str, pipeline_type: str):
+    """Load a LoRA adapter pair (high + low noise) by name if not already loaded."""
+    adapter_high = f"{name}_high"
+    adapter_low = f"{name}_low"
+
+    if name in pipe._loaded_lora_names:
+        return adapter_high, adapter_low
+
+    # Try local directory first: loras/<pipeline_type>/<name>/high.safetensors
+    local_dir = _LORA_DIR / pipeline_type / name
+    high_path = local_dir / "high.safetensors"
+    low_path = local_dir / "low.safetensors"
+
+    if high_path.is_file() and low_path.is_file():
+        logger.info(f"[WAN] Loading LoRA '{name}' from {local_dir}")
+        pipe.load_lora_weights(
+            str(local_dir), weight_name="high.safetensors", adapter_name=adapter_high
+        )
+        pipe.load_lora_weights(
+            str(local_dir),
+            weight_name="low.safetensors",
+            adapter_name=adapter_low,
+            load_into_transformer_2=True,
+        )
+    elif name in _LORA_REGISTRY:
+        reg = _LORA_REGISTRY[name]
+        logger.info(f"[WAN] Loading LoRA '{name}' from {reg['repo']}")
+        pipe.load_lora_weights(
+            reg["repo"],
+            weight_name=reg[f"{pipeline_type}_high"],
+            adapter_name=adapter_high,
+        )
+        pipe.load_lora_weights(
+            reg["repo"],
+            weight_name=reg[f"{pipeline_type}_low"],
+            adapter_name=adapter_low,
+            load_into_transformer_2=True,
+        )
+    else:
+        raise ValueError(f"LoRA '{name}' not found in {local_dir} or registry")
+
+    pipe._loaded_lora_names.add(name)
+    logger.info(
+        f"[WAN] LoRA '{name}' loaded as adapters [{adapter_high}, {adapter_low}]"
+    )
+    return adapter_high, adapter_low
+
+
+def _setup_distill_scheduler(pipe):
+    """Create an Euler scheduler with forced distill timesteps."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    import numpy as np
+
+    pipe._base_scheduler = pipe.scheduler
+
+    orig_cfg = pipe.scheduler.config
+    euler = FlowMatchEulerDiscreteScheduler(
+        num_train_timesteps=orig_cfg.num_train_timesteps,
+        shift=orig_cfg.get("flow_shift", 1.0),
+    )
+
+    def _distill_set_timesteps(self, num_inference_steps=None, device=None, **kwargs):
+        num_train = self.config.num_train_timesteps
+        n = num_inference_steps if num_inference_steps else len(_DISTILL_STEPS)
+        steps = [int(1000 - i * (1000 / n)) for i in range(n)]
+        sigmas = np.array([t / num_train for t in steps], dtype=np.float32)
+        sigmas[0] = min(sigmas[0], 1.0 - 1e-6)
+        sigmas = np.concatenate([sigmas, [0.0]])
+        self.sigmas = torch.from_numpy(sigmas)
+        self.timesteps = (self.sigmas[:-1] * num_train).to(
+            device=device, dtype=torch.int64
+        )
+        self.num_inference_steps = n
+        self._step_index = None
+        self._begin_index = None
+
+    euler.set_timesteps = _distill_set_timesteps.__get__(
+        euler, FlowMatchEulerDiscreteScheduler
+    )
+    pipe._distill_scheduler = euler
+    pipe.scheduler = euler
+
+
 def _load_wan_t2v():
-    """Load Wan 2.1 T2V 1.3B pipeline (bf16, no quantization needed)."""
+    """Load Wan 2.2 T2V A14B MoE pipeline (4-bit NF4 quantized dual transformers)."""
     global _wan_t2v_pipe
 
     if _wan_t2v_pipe is not None:
         return _wan_t2v_pipe
 
-    from diffusers import WanPipeline
+    from diffusers import AutoencoderKLWan, BitsAndBytesConfig, WanPipeline
+    from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
 
     device = "cuda:0"
-    local_cached = os.path.isdir(_WAN_T2V_LOCAL_CACHE) and os.path.isfile(
-        os.path.join(_WAN_T2V_LOCAL_CACHE, "model_index.json")
+    local_cached = (
+        _WAN_T2V_LOCAL_CACHE.is_dir()
+        and (_WAN_T2V_LOCAL_CACHE / "model_index.json").is_file()
     )
-    src = _WAN_T2V_LOCAL_CACHE if local_cached else _WAN_T2V_REPO
 
-    logger.info(f"[WAN-T2V] Loading from {src}...")
-    t0 = time.monotonic()
-    pipe = WanPipeline.from_pretrained(src, torch_dtype=torch.bfloat16)
-    logger.info(f"[WAN-T2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+    if local_cached:
+        logger.info(
+            f"[WAN-T2V] Loading cached 4-bit pipeline from {_WAN_T2V_LOCAL_CACHE}..."
+        )
+        t0 = time.monotonic()
+        pipe = WanPipeline.from_pretrained(
+            _WAN_T2V_LOCAL_CACHE, torch_dtype=torch.bfloat16
+        )
+        logger.info(f"[WAN-T2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s")
+    else:
+        bnb_4bit = dict(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+        )
+        quant_config = PipelineQuantizationConfig(
+            quant_mapping={
+                "transformer": BitsAndBytesConfig(**bnb_4bit),
+                "transformer_2": BitsAndBytesConfig(**bnb_4bit),
+            }
+        )
+        logger.info("[WAN-T2V] Loading with 4-bit quantized dual transformers...")
+        t0 = time.monotonic()
+        vae = AutoencoderKLWan.from_pretrained(
+            _WAN_T2V_REPO, subfolder="vae", torch_dtype=torch.float32
+        )
+        pipe = WanPipeline.from_pretrained(
+            _WAN_T2V_REPO,
+            vae=vae,
+            quantization_config=quant_config,
+            torch_dtype=torch.bfloat16,
+        )
+        logger.info(f"[WAN-T2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
 
-    if not local_cached:
         logger.info(f"[WAN-T2V] Saving to {_WAN_T2V_LOCAL_CACHE}...")
         t0 = time.monotonic()
         pipe.save_pretrained(_WAN_T2V_LOCAL_CACHE)
@@ -65,25 +225,30 @@ def _load_wan_t2v():
 
     pipe.to(device)
     pipe.vae.enable_tiling()
-    logger.info("[WAN-T2V] Loaded on GPU + VAE tiling enabled")
+    pipe.register_to_config(boundary_ratio=_BOUNDARY_RATIO)
+
+    _setup_distill_scheduler(pipe)
+    pipe._loaded_lora_names = set()
+    logger.info("[WAN-T2V] Loaded on GPU + distill scheduler (LoRAs loaded on demand)")
 
     _wan_t2v_pipe = pipe
     return _wan_t2v_pipe
 
 
 def _load_wan_i2v():
-    """Load Wan 2.1 I2V 14B pipeline (4-bit NF4 quantized transformer)."""
+    """Load Wan 2.2 I2V A14B MoE pipeline (4-bit NF4 quantized dual transformers)."""
     global _wan_i2v_pipe
 
     if _wan_i2v_pipe is not None:
         return _wan_i2v_pipe
 
-    from diffusers import BitsAndBytesConfig, WanImageToVideoPipeline
+    from diffusers import AutoencoderKLWan, BitsAndBytesConfig, WanImageToVideoPipeline
     from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
 
     device = "cuda:0"
-    local_cached = os.path.isdir(_WAN_I2V_LOCAL_CACHE) and os.path.isfile(
-        os.path.join(_WAN_I2V_LOCAL_CACHE, "model_index.json")
+    local_cached = (
+        _WAN_I2V_LOCAL_CACHE.is_dir()
+        and (_WAN_I2V_LOCAL_CACHE / "model_index.json").is_file()
     )
 
     if local_cached:
@@ -104,12 +269,17 @@ def _load_wan_i2v():
         quant_config = PipelineQuantizationConfig(
             quant_mapping={
                 "transformer": BitsAndBytesConfig(**bnb_4bit),
+                "transformer_2": BitsAndBytesConfig(**bnb_4bit),
             }
         )
-        logger.info("[WAN-I2V] Loading with 4-bit quantized transformer...")
+        logger.info("[WAN-I2V] Loading with 4-bit quantized dual transformers...")
         t0 = time.monotonic()
+        vae = AutoencoderKLWan.from_pretrained(
+            _WAN_I2V_REPO, subfolder="vae", torch_dtype=torch.float32
+        )
         pipe = WanImageToVideoPipeline.from_pretrained(
             _WAN_I2V_REPO,
+            vae=vae,
             quantization_config=quant_config,
             torch_dtype=torch.bfloat16,
         )
@@ -122,48 +292,11 @@ def _load_wan_i2v():
 
     pipe.to(device)
     pipe.vae.enable_tiling()
+    pipe.register_to_config(boundary_ratio=_BOUNDARY_RATIO)
 
-    # Load LightX2V 4-step distill LoRA
-    logger.info("[WAN-I2V] Loading LightX2V 4-step distill LoRA...")
-    t0 = time.monotonic()
-    pipe.load_lora_weights(_DISTILL_LORA_REPO, weight_name=_DISTILL_LORA_I2V)
-    logger.info(f"[WAN-I2V] LoRA loaded in {time.monotonic() - t0:.1f}s")
-
-    # Use FlowMatchEulerDiscreteScheduler with forced distill timesteps.
-    # Euler is the correct solver for distilled models (single-step prediction).
-    # UniPC's multi-step state causes both device bugs and wrong results with distill.
-    from diffusers import FlowMatchEulerDiscreteScheduler
-    import numpy as np
-
-    # Keep the original scheduler for non-distill (full-step) mode
-    pipe._base_scheduler = pipe.scheduler
-
-    orig_cfg = pipe.scheduler.config
-    euler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=orig_cfg.num_train_timesteps,
-        shift=orig_cfg.get("flow_shift", 1.0),
-    )
-
-    def _distill_set_timesteps(self, num_inference_steps=None, device=None, **kwargs):
-        num_train = self.config.num_train_timesteps
-        sigmas = np.array([t / num_train for t in _DISTILL_STEPS], dtype=np.float32)
-        # Clamp first sigma below 1.0 to avoid log(0) = -inf
-        sigmas[0] = min(sigmas[0], 1.0 - 1e-6)
-        sigmas = np.concatenate([sigmas, [0.0]])
-        self.sigmas = torch.from_numpy(sigmas)
-        self.timesteps = (self.sigmas[:-1] * num_train).to(
-            device=device, dtype=torch.int64
-        )
-        self.num_inference_steps = len(_DISTILL_STEPS)
-        self._step_index = None
-        self._begin_index = None
-
-    euler.set_timesteps = _distill_set_timesteps.__get__(
-        euler, FlowMatchEulerDiscreteScheduler
-    )
-    pipe._distill_scheduler = euler
-    pipe.scheduler = euler
-    logger.info("[WAN-I2V] Loaded on GPU + distill LoRA + Euler 4-step schedule")
+    _setup_distill_scheduler(pipe)
+    pipe._loaded_lora_names = set()
+    logger.info("[WAN-I2V] Loaded on GPU + distill scheduler (LoRAs loaded on demand)")
 
     _wan_i2v_pipe = pipe
     return _wan_i2v_pipe
@@ -187,6 +320,7 @@ def cleanup_wan_resources():
 
 @router.post("/video", response_class=Response)
 async def generate_video(
+    request: Request,
     prompt: str = Form(...),
     negative_prompt: str = Form(
         default="worst quality, inconsistent motion, blurry, jittery, distorted"
@@ -198,8 +332,13 @@ async def generate_video(
     height: int = Form(default=480),
     num_frames: int = Form(default=81),
     frame_rate: float = Form(default=16.0),
-    num_inference_steps: int = Form(default=30),
-    guidance_scale: float = Form(default=5.0),
+    num_inference_steps: int = Form(default=40),
+    guidance_scale: float = Form(default=4.0),
+    guidance_scale_2: float = Form(default=3.0),
+    boundary_ratio: float = Form(default=_BOUNDARY_RATIO),
+    distill_steps: int = Form(default=_DISTILL_NUM_STEPS),
+    lora_weight_high: float = Form(default=_DISTILL_LORA_WEIGHT_HIGH),
+    lora_weight_low: float = Form(default=_DISTILL_LORA_WEIGHT_LOW),
     seed: int = Form(default=-1),
 ):
     """Generate a video from a text prompt (and optional starting image) using Wan 2.2."""
@@ -251,38 +390,58 @@ async def generate_video(
         )
 
     if input_image is not None:
-        # ── Image-to-Video (14B, 4-bit + distill LoRA) ────────────────────
+        # ── Image-to-Video (A14B MoE, 4-bit + distill LoRA) ──────────────
+        # Free T2V pipeline VRAM if loaded — can't fit both A14B pipelines
+        global _wan_t2v_pipe
+        if _wan_t2v_pipe is not None:
+            del _wan_t2v_pipe
+            _wan_t2v_pipe = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info("[WAN] Released T2V pipeline to make room for I2V")
         pipe = _load_wan_i2v()
+        pipe.register_to_config(boundary_ratio=boundary_ratio)
 
-        # Monkey-patch encode_image so that when the pipeline internally calls
-        # encode_image([image, last_image]) (batch=2), we flatten to (1, 2*S, D)
-        # to match the text embedding batch dim. Without this the transformer's
-        # concat on dim=1 fails with mismatched batch sizes.
-        if not hasattr(pipe, "_orig_encode_image"):
-            pipe._orig_encode_image = pipe.encode_image.__func__
-
-            def _patched_encode_image(self, image, device=None):
-                embeds = self._orig_encode_image(self, image, device)
-                if embeds.shape[0] > 1:
-                    embeds = embeds.reshape(1, -1, embeds.shape[-1])
-                return embeds
-
-            pipe.encode_image = _patched_encode_image.__get__(pipe, type(pipe))
+        # Parse LoRA params from multipart form (loras.N.name / .weight_high / .weight_low)
+        form = await request.form()
+        loras = _parse_lora_params(form)
 
         if lightning:
-            # Fast 4-step distill LoRA mode
-            pipe.enable_lora()
+            if not loras:
+                loras = [
+                    {
+                        "name": "distill",
+                        "weight_high": lora_weight_high,
+                        "weight_low": lora_weight_low,
+                    }
+                ]
             pipe.scheduler = pipe._distill_scheduler
-            n_steps = len(_DISTILL_STEPS)
+            n_steps = distill_steps
             cfg = 1.0  # CFG must be disabled for distill LoRA
-            mode = "I2V-14B-distill"
+            cfg2 = 1.0
+            lora_desc = "+".join(l["name"] for l in loras)
+            mode = f"I2V-distill-{distill_steps}step [{lora_desc}]"
         else:
-            # Full quality mode — base model weights, original scheduler
-            pipe.disable_lora()
             pipe.scheduler = pipe._base_scheduler
             n_steps = num_inference_steps
             cfg = guidance_scale
-            mode = "I2V-14B-base"
+            cfg2 = guidance_scale_2
+            mode = "I2V-A14B-base"
+
+        # Activate requested LoRAs (or disable if none)
+        if loras:
+            adapter_names = []
+            adapter_weights = []
+            for lora in loras:
+                try:
+                    high, low = _ensure_lora_loaded(pipe, lora["name"], "i2v")
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+                adapter_names.extend([high, low])
+                adapter_weights.extend([lora["weight_high"], lora["weight_low"]])
+            pipe.set_adapters(adapter_names, adapter_weights)
+        else:
+            pipe.disable_lora()
 
         logger.info(f"[WAN] {mode}: generating {width}x{height} @ {n_steps} steps...")
         t0 = time.monotonic()
@@ -296,18 +455,67 @@ async def generate_video(
             num_frames=num_frames,
             num_inference_steps=n_steps,
             guidance_scale=cfg,
+            guidance_scale_2=cfg2,
             generator=generator,
             output_type="np",
             return_dict=False,
             callback_on_step_end=_progress_cb(n_steps),
         )
     else:
-        # ── Text-to-Video (1.3B, bf16) ───────────────────────────────────
+        # ── Text-to-Video (A14B MoE, 4-bit + distill LoRA) ───────────────
+        # Free I2V pipeline VRAM if loaded — can't fit both A14B pipelines
+        global _wan_i2v_pipe
+        if _wan_i2v_pipe is not None:
+            del _wan_i2v_pipe
+            _wan_i2v_pipe = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info("[WAN] Released I2V pipeline to make room for T2V")
         pipe = _load_wan_t2v()
-        mode = "T2V-1.3B"
-        logger.info(
-            f"[WAN] {mode}: generating {width}x{height} @ {num_inference_steps} steps..."
-        )
+        pipe.register_to_config(boundary_ratio=boundary_ratio)
+
+        # Parse LoRA params from multipart form (loras.N.name / .weight_high / .weight_low)
+        form = await request.form()
+        loras = _parse_lora_params(form)
+
+        if lightning:
+            if not loras:
+                loras = [
+                    {
+                        "name": "distill",
+                        "weight_high": lora_weight_high,
+                        "weight_low": lora_weight_low,
+                    }
+                ]
+            pipe.scheduler = pipe._distill_scheduler
+            n_steps = distill_steps
+            cfg = 1.0
+            cfg2 = 1.0
+            lora_desc = "+".join(l["name"] for l in loras)
+            mode = f"T2V-distill-{distill_steps}step [{lora_desc}]"
+        else:
+            pipe.scheduler = pipe._base_scheduler
+            n_steps = num_inference_steps
+            cfg = guidance_scale
+            cfg2 = guidance_scale_2
+            mode = "T2V-A14B-base"
+
+        # Activate requested LoRAs (or disable if none)
+        if loras:
+            adapter_names = []
+            adapter_weights = []
+            for lora in loras:
+                try:
+                    high, low = _ensure_lora_loaded(pipe, lora["name"], "t2v")
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+                adapter_names.extend([high, low])
+                adapter_weights.extend([lora["weight_high"], lora["weight_low"]])
+            pipe.set_adapters(adapter_names, adapter_weights)
+        else:
+            pipe.disable_lora()
+
+        logger.info(f"[WAN] {mode}: generating {width}x{height} @ {n_steps} steps...")
         t0 = time.monotonic()
         output = pipe(
             prompt=prompt,
@@ -315,12 +523,13 @@ async def generate_video(
             width=width,
             height=height,
             num_frames=num_frames,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
+            num_inference_steps=n_steps,
+            guidance_scale=cfg,
+            guidance_scale_2=cfg2,
             generator=generator,
             output_type="np",
             return_dict=False,
-            callback_on_step_end=_progress_cb(num_inference_steps),
+            callback_on_step_end=_progress_cb(n_steps),
         )
 
     video_frames = output[0][0]  # (num_frames, H, W, 3) float32 [0,1]
@@ -339,8 +548,7 @@ async def generate_video(
         with open(tmp_path, "rb") as f:
             video_bytes = f.read()
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        Path(tmp_path).unlink(missing_ok=True)
 
     logger.info(f"[WAN] Video generated: {len(video_bytes) / 1024 / 1024:.1f} MB")
 
@@ -428,4 +636,4 @@ async def generate_frames(video: UploadFile = File(...), num_frames: int = Form(
             headers={"Content-Disposition": f"attachment; filename=frames_assets.zip"},
         )
     finally:
-        os.unlink(temp_video.name)
+        Path(temp_video.name).unlink(missing_ok=True)
