@@ -55,8 +55,20 @@ _LORA_REGISTRY = {
 }
 
 _CACHES_DIR = Path(__file__).resolve().parent.parent / "caches"
-_WAN_T2V_LOCAL_CACHE = _CACHES_DIR / "wan-t2v-a14b-4bit"
-_WAN_I2V_LOCAL_CACHE = _CACHES_DIR / "wan-i2v-a14b-4bit"
+
+
+def _is_h100() -> bool:
+    """Check at call time whether we're running on an H100 instance."""
+    return os.getenv("INSTANCE_TYPE") == "H100-1-80G"
+
+
+def _wan_t2v_cache_dir() -> Path:
+    return _CACHES_DIR / ("wan-t2v-a14b-fp8" if _is_h100() else "wan-t2v-a14b-4bit")
+
+
+def _wan_i2v_cache_dir() -> Path:
+    return _CACHES_DIR / ("wan-i2v-a14b-fp8" if _is_h100() else "wan-i2v-a14b-4bit")
+
 
 _wan_t2v_pipe = None
 _wan_i2v_pipe = None
@@ -169,59 +181,101 @@ def _setup_distill_scheduler(pipe):
 
 
 def _load_wan_t2v():
-    """Load Wan 2.2 T2V A14B MoE pipeline (4-bit NF4 quantized dual transformers)."""
+    """Load Wan 2.2 T2V A14B MoE pipeline (FP8 on H100, 4-bit NF4 otherwise)."""
     global _wan_t2v_pipe
 
     if _wan_t2v_pipe is not None:
         return _wan_t2v_pipe
 
-    from diffusers import AutoencoderKLWan, BitsAndBytesConfig, WanPipeline
-    from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
+    from diffusers import AutoencoderKLWan, WanPipeline
 
     device = "cuda:0"
-    local_cached = (
-        _WAN_T2V_LOCAL_CACHE.is_dir()
-        and (_WAN_T2V_LOCAL_CACHE / "model_index.json").is_file()
-    )
+    h100 = _is_h100()
 
-    if local_cached:
-        logger.info(
-            f"[WAN-T2V] Loading cached 4-bit pipeline from {_WAN_T2V_LOCAL_CACHE}..."
-        )
-        t0 = time.monotonic()
-        pipe = WanPipeline.from_pretrained(
-            _WAN_T2V_LOCAL_CACHE, torch_dtype=torch.bfloat16
-        )
-        logger.info(f"[WAN-T2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s")
+    if h100:
+        from diffusers import TorchAoConfig
+        from torchao.quantization import Float8WeightOnlyConfig
+        from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
+
+        cache_dir = _wan_t2v_cache_dir()
+        local_cached = cache_dir.is_dir() and (cache_dir / "model_index.json").is_file()
+
+        if local_cached:
+            logger.info(f"[WAN-T2V] Loading cached FP8 pipeline from {cache_dir}...")
+            t0 = time.monotonic()
+            pipe = WanPipeline.from_pretrained(cache_dir, torch_dtype=torch.bfloat16)
+            logger.info(
+                f"[WAN-T2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s"
+            )
+        else:
+            fp8_config = TorchAoConfig(Float8WeightOnlyConfig())
+            quant_config = PipelineQuantizationConfig(
+                quant_mapping={
+                    "transformer": fp8_config,
+                    "transformer_2": fp8_config,
+                }
+            )
+            logger.info(
+                "[WAN-T2V] Loading with FP8 quantized dual transformers (H100)..."
+            )
+            t0 = time.monotonic()
+            vae = AutoencoderKLWan.from_pretrained(
+                _WAN_T2V_REPO, subfolder="vae", torch_dtype=torch.float32
+            )
+            pipe = WanPipeline.from_pretrained(
+                _WAN_T2V_REPO,
+                vae=vae,
+                quantization_config=quant_config,
+                torch_dtype=torch.bfloat16,
+            )
+            logger.info(f"[WAN-T2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+
+            logger.info(f"[WAN-T2V] Saving FP8 cache to {cache_dir}...")
+            t0 = time.monotonic()
+            pipe.save_pretrained(cache_dir, safe_serialization=False)
+            logger.info(f"[WAN-T2V] Saved in {time.monotonic() - t0:.1f}s")
     else:
-        bnb_4bit = dict(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        )
-        quant_config = PipelineQuantizationConfig(
-            quant_mapping={
-                "transformer": BitsAndBytesConfig(**bnb_4bit),
-                "transformer_2": BitsAndBytesConfig(**bnb_4bit),
-            }
-        )
-        logger.info("[WAN-T2V] Loading with 4-bit quantized dual transformers...")
-        t0 = time.monotonic()
-        vae = AutoencoderKLWan.from_pretrained(
-            _WAN_T2V_REPO, subfolder="vae", torch_dtype=torch.float32
-        )
-        pipe = WanPipeline.from_pretrained(
-            _WAN_T2V_REPO,
-            vae=vae,
-            quantization_config=quant_config,
-            torch_dtype=torch.bfloat16,
-        )
-        logger.info(f"[WAN-T2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+        from diffusers import BitsAndBytesConfig
+        from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
 
-        logger.info(f"[WAN-T2V] Saving to {_WAN_T2V_LOCAL_CACHE}...")
-        t0 = time.monotonic()
-        pipe.save_pretrained(_WAN_T2V_LOCAL_CACHE)
-        logger.info(f"[WAN-T2V] Saved in {time.monotonic() - t0:.1f}s")
+        cache_dir = _wan_t2v_cache_dir()
+        local_cached = cache_dir.is_dir() and (cache_dir / "model_index.json").is_file()
+        if local_cached:
+            logger.info(f"[WAN-T2V] Loading cached pipeline from {cache_dir}...")
+            t0 = time.monotonic()
+            pipe = WanPipeline.from_pretrained(cache_dir, torch_dtype=torch.bfloat16)
+            logger.info(
+                f"[WAN-T2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s"
+            )
+        else:
+            bnb_4bit = dict(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            )
+            quant_config = PipelineQuantizationConfig(
+                quant_mapping={
+                    "transformer": BitsAndBytesConfig(**bnb_4bit),
+                    "transformer_2": BitsAndBytesConfig(**bnb_4bit),
+                }
+            )
+            logger.info("[WAN-T2V] Loading with 4-bit quantized dual transformers...")
+            t0 = time.monotonic()
+            vae = AutoencoderKLWan.from_pretrained(
+                _WAN_T2V_REPO, subfolder="vae", torch_dtype=torch.float32
+            )
+            pipe = WanPipeline.from_pretrained(
+                _WAN_T2V_REPO,
+                vae=vae,
+                quantization_config=quant_config,
+                torch_dtype=torch.bfloat16,
+            )
+            logger.info(f"[WAN-T2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+
+            logger.info(f"[WAN-T2V] Saving to {cache_dir}...")
+            t0 = time.monotonic()
+            pipe.save_pretrained(cache_dir)
+            logger.info(f"[WAN-T2V] Saved in {time.monotonic() - t0:.1f}s")
 
     pipe.to(device)
     pipe.vae.enable_tiling()
@@ -236,59 +290,105 @@ def _load_wan_t2v():
 
 
 def _load_wan_i2v():
-    """Load Wan 2.2 I2V A14B MoE pipeline (4-bit NF4 quantized dual transformers)."""
+    """Load Wan 2.2 I2V A14B MoE pipeline (FP8 on H100, 4-bit NF4 otherwise)."""
     global _wan_i2v_pipe
 
     if _wan_i2v_pipe is not None:
         return _wan_i2v_pipe
 
-    from diffusers import AutoencoderKLWan, BitsAndBytesConfig, WanImageToVideoPipeline
-    from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
+    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
 
     device = "cuda:0"
-    local_cached = (
-        _WAN_I2V_LOCAL_CACHE.is_dir()
-        and (_WAN_I2V_LOCAL_CACHE / "model_index.json").is_file()
-    )
+    h100 = _is_h100()
 
-    if local_cached:
-        logger.info(
-            f"[WAN-I2V] Loading cached 4-bit pipeline from {_WAN_I2V_LOCAL_CACHE}..."
-        )
-        t0 = time.monotonic()
-        pipe = WanImageToVideoPipeline.from_pretrained(
-            _WAN_I2V_LOCAL_CACHE, torch_dtype=torch.bfloat16
-        )
-        logger.info(f"[WAN-I2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s")
+    if h100:
+        from diffusers import TorchAoConfig
+        from torchao.quantization import Float8WeightOnlyConfig
+        from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
+
+        cache_dir = _wan_i2v_cache_dir()
+        local_cached = cache_dir.is_dir() and (cache_dir / "model_index.json").is_file()
+
+        if local_cached:
+            logger.info(f"[WAN-I2V] Loading cached FP8 pipeline from {cache_dir}...")
+            t0 = time.monotonic()
+            pipe = WanImageToVideoPipeline.from_pretrained(
+                cache_dir, torch_dtype=torch.bfloat16
+            )
+            logger.info(
+                f"[WAN-I2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s"
+            )
+        else:
+            fp8_config = TorchAoConfig(Float8WeightOnlyConfig())
+            quant_config = PipelineQuantizationConfig(
+                quant_mapping={
+                    "transformer": fp8_config,
+                    "transformer_2": fp8_config,
+                }
+            )
+            logger.info(
+                "[WAN-I2V] Loading with FP8 quantized dual transformers (H100)..."
+            )
+            t0 = time.monotonic()
+            vae = AutoencoderKLWan.from_pretrained(
+                _WAN_I2V_REPO, subfolder="vae", torch_dtype=torch.float32
+            )
+            pipe = WanImageToVideoPipeline.from_pretrained(
+                _WAN_I2V_REPO,
+                vae=vae,
+                quantization_config=quant_config,
+                torch_dtype=torch.bfloat16,
+            )
+            logger.info(f"[WAN-I2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+
+            logger.info(f"[WAN-I2V] Saving FP8 cache to {cache_dir}...")
+            t0 = time.monotonic()
+            pipe.save_pretrained(cache_dir, safe_serialization=False)
+            logger.info(f"[WAN-I2V] Saved in {time.monotonic() - t0:.1f}s")
     else:
-        bnb_4bit = dict(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        )
-        quant_config = PipelineQuantizationConfig(
-            quant_mapping={
-                "transformer": BitsAndBytesConfig(**bnb_4bit),
-                "transformer_2": BitsAndBytesConfig(**bnb_4bit),
-            }
-        )
-        logger.info("[WAN-I2V] Loading with 4-bit quantized dual transformers...")
-        t0 = time.monotonic()
-        vae = AutoencoderKLWan.from_pretrained(
-            _WAN_I2V_REPO, subfolder="vae", torch_dtype=torch.float32
-        )
-        pipe = WanImageToVideoPipeline.from_pretrained(
-            _WAN_I2V_REPO,
-            vae=vae,
-            quantization_config=quant_config,
-            torch_dtype=torch.bfloat16,
-        )
-        logger.info(f"[WAN-I2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+        from diffusers import BitsAndBytesConfig
+        from diffusers.quantizers.pipe_quant_config import PipelineQuantizationConfig
 
-        logger.info(f"[WAN-I2V] Saving to {_WAN_I2V_LOCAL_CACHE}...")
-        t0 = time.monotonic()
-        pipe.save_pretrained(_WAN_I2V_LOCAL_CACHE)
-        logger.info(f"[WAN-I2V] Saved in {time.monotonic() - t0:.1f}s")
+        cache_dir = _wan_i2v_cache_dir()
+        local_cached = cache_dir.is_dir() and (cache_dir / "model_index.json").is_file()
+        if local_cached:
+            logger.info(f"[WAN-I2V] Loading cached pipeline from {cache_dir}...")
+            t0 = time.monotonic()
+            pipe = WanImageToVideoPipeline.from_pretrained(
+                cache_dir, torch_dtype=torch.bfloat16
+            )
+            logger.info(
+                f"[WAN-I2V] Cached pipeline loaded in {time.monotonic() - t0:.1f}s"
+            )
+        else:
+            bnb_4bit = dict(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            )
+            quant_config = PipelineQuantizationConfig(
+                quant_mapping={
+                    "transformer": BitsAndBytesConfig(**bnb_4bit),
+                    "transformer_2": BitsAndBytesConfig(**bnb_4bit),
+                }
+            )
+            logger.info("[WAN-I2V] Loading with 4-bit quantized dual transformers...")
+            t0 = time.monotonic()
+            vae = AutoencoderKLWan.from_pretrained(
+                _WAN_I2V_REPO, subfolder="vae", torch_dtype=torch.float32
+            )
+            pipe = WanImageToVideoPipeline.from_pretrained(
+                _WAN_I2V_REPO,
+                vae=vae,
+                quantization_config=quant_config,
+                torch_dtype=torch.bfloat16,
+            )
+            logger.info(f"[WAN-I2V] Pipeline loaded in {time.monotonic() - t0:.1f}s")
+
+            logger.info(f"[WAN-I2V] Saving to {cache_dir}...")
+            t0 = time.monotonic()
+            pipe.save_pretrained(cache_dir)
+            logger.info(f"[WAN-I2V] Saved in {time.monotonic() - t0:.1f}s")
 
     pipe.to(device)
     pipe.vae.enable_tiling()

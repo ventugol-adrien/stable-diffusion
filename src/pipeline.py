@@ -21,7 +21,10 @@ WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
 MODELS_DIR = Path.home() / "sd_models"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.enabled = (
+    False  # pip nvidia-cudnn-cu12 conflicts with system CUDA 12.8 driver
+)
+torch.backends.cuda.enable_cudnn_sdp(False)  # also disable cuDNN SDPA backend
 
 
 def cleanup_resources():
@@ -111,7 +114,7 @@ def get_pipe(model: str = "juggernaut"):
         print("🔄 Switching pipeline/model. Clearing VRAM...")
         cleanup_resources()
 
-    print(f"🚀 Initializing Optimized Pipeline for L40S (Ada Lovelace)...")
+    print(f"🚀 Initializing Optimized Pipeline for {os.getenv('INSTANCE_TYPE')}...")
 
     pipe = _load_pipeline(model)
     pipe.enable_freeu(
