@@ -22,6 +22,14 @@ class DivergentSpace(BaseModel):
     ip_image: UploadFile = None
     ip_scale: float = None
 
+    # Spatial transform parameters (sent as 0.transform.dx, 0.transform.dy, etc.)
+    transform_input_image: UploadFile = None
+    transform_dx: int = None
+    transform_dy: int = None
+    transform_z: float = None
+    transform_r: float = None
+    transform_strength: float = None
+
 
 class ImageRequest(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
@@ -42,6 +50,7 @@ class ImageRequest(BaseModel):
     image_seed: int = -1
     prompt_seed: int = -1
     batch_size: int = 1
+    final_strength: float = None
 
     @classmethod
     async def as_form(cls, request: Request) -> "ImageRequest":
@@ -57,7 +66,8 @@ class ImageRequest(BaseModel):
                 parts = key.split(".", 1)
                 if parts[0].isdigit():
                     idx = int(parts[0])
-                    field = parts[1]
+                    # Collapse nested dots: "transform.dx" → "transform_dx"
+                    field = parts[1].replace(".", "_")
                     if idx not in divergent_spaces:
                         divergent_spaces[idx] = {}
 

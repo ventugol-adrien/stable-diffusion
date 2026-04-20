@@ -17,6 +17,8 @@ from src.transform import TransformParams, apply_transforms, lama_fill
 
 ANNOTATORS_DIR = Path.home() / "sd_annotators"
 
+_cached_asset_generator: "ControlNetAssetGenerator | None" = None
+
 
 class AssetRequest(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
@@ -92,6 +94,20 @@ class ControlNetAssetGenerator:
         elif torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
+    def generate_depth(self, image: Image.Image) -> Image.Image:
+        """Generate a depth map from an RGB image."""
+        if not self.depth_pipe:
+            raise RuntimeError("Depth pipeline not initialized.")
+        return self.depth_pipe(image)["depth"]
+
+    def generate_canny(self, image: Image.Image) -> Image.Image:
+        """Generate canny/PidiNet edges from an RGB image."""
+        if not self.edge_pipe:
+            raise RuntimeError("Edge pipeline not initialized.")
+        return self.edge_pipe(
+            image, detect_resolution=1024, image_resolution=1024, safe=False
+        )
 
     def _extract_masks(
         self, depth_pil: Image.Image, edge_pil: Image.Image
@@ -353,6 +369,15 @@ def process_mask(mask_pil: Image.Image) -> Image.Image:
     return Image.fromarray(soft)
 
 
+def get_asset_generator() -> ControlNetAssetGenerator:
+    """Lazy singleton for ControlNetAssetGenerator."""
+    global _cached_asset_generator
+    if _cached_asset_generator is None:
+        logger.info("Initializing ControlNet asset generator (first use)...")
+        _cached_asset_generator = ControlNetAssetGenerator()
+    return _cached_asset_generator
+
+
 @router.post("/generate", response_class=Response)
 async def generate_controlnet_assets(
     request: AssetRequest = Depends(AssetRequest.as_form),
@@ -360,7 +385,7 @@ async def generate_controlnet_assets(
     """
     API endpoint to generate a SOTA depth map, edge map, and compositing masks archive.
     """
-    generator = ControlNetAssetGenerator()
+    generator = get_asset_generator()
 
     img_bytes = await request.input_image.read()
 

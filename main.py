@@ -16,8 +16,6 @@ from diffusers import (
     ControlNetModel,
 )
 from PIL import Image, ImageOps
-from diffusers import AutoPipelineForImage2Image
-from PIL import Image
 
 from src.pipeline import (
     get_pipe,
@@ -30,7 +28,8 @@ from src.pipeline import (
 from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
 
-from src.controlnet import router as depthmap_router
+from src.controlnet import router as depthmap_router, get_asset_generator
+from src.transform import TransformParams, apply_transforms, lama_fill
 
 import torch
 
@@ -88,7 +87,10 @@ app.include_router(loras_router)
 
 
 @app.post("/generate/image")
-def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form)):
+def handle_generate_image(
+    request: ImageRequest = Depends(ImageRequest.as_form),
+    returnAssets: bool = False,
+):
     breakdown = {}
     start_time = time.monotonic()
 
@@ -175,17 +177,82 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
         import torchvision.transforms.functional as TF
 
         batch_size = request.batch_size
-        has_depth = any(ds.depthmap for ds in request.divergent_spaces)
-        has_canny = any(ds.canny_edges for ds in request.divergent_spaces)
-        has_mask_in_divergent = any(ds.mask for ds in request.divergent_spaces)
+
+        # --- Pre-process spatial transforms ---
+        # When a space has transform params, we transform the input image,
+        # LaMa-fill voids, extract depth + canny from the clean result,
+        # transform the mask with black void fill, and inject the results
+        # back into the space so the existing tensor-building code picks
+        # them up seamlessly.
+        for space in request.divergent_spaces:
+            if space.transform_input_image is None:
+                continue
+
+            t_params = TransformParams(
+                dx=space.transform_dx or 0,
+                dy=space.transform_dy or 0,
+                z=space.transform_z or 1.0,
+                r=space.transform_r or 0.0,
+            )
+            print(f"🔄 Applying spatial transform: {t_params}")
+
+            # Transform the input image and LaMa-fill voids
+            input_img = Image.open(space.transform_input_image.file).convert("RGB")
+            transformed_rgb, void_mask = apply_transforms(input_img, t_params)
+            has_voids = void_mask.getbbox() is not None
+            if has_voids:
+                filled_rgb = lama_fill(transformed_rgb, void_mask)
+            else:
+                filled_rgb = transformed_rgb
+
+            # Extract depth + canny from the clean filled image
+            generator = get_asset_generator()
+            space._generated_depth = generator.generate_depth(filled_rgb)
+            space._generated_canny = generator.generate_canny(filled_rgb)
+
+            # Store the LaMa-filled result for optional blending with reference
+            space._transform_fill = filled_rgb
+
+            # Discard uploaded depth/canny images — transform-generated ones take over.
+            # Scales are preserved so the existing tensor-building code uses them.
+            space.depthmap = None
+            space.canny_edges = None
+
+            # Transform the mask with black (0) void fill
+            if space.mask:
+                mask_img = Image.open(space.mask.file).convert("L")
+                transformed_mask, _ = apply_transforms(mask_img, t_params)
+                space._generated_mask = transformed_mask
+            else:
+                # No mask provided — create one where voids = black (don't inpaint)
+                space._generated_mask = Image.eval(
+                    void_mask, lambda v: 0 if v > 0 else 255
+                ).convert("L")
+
+        has_depth = any(
+            ds.depthmap or hasattr(ds, "_generated_depth")
+            for ds in request.divergent_spaces
+        )
+        has_canny = any(
+            ds.canny_edges or hasattr(ds, "_generated_canny")
+            for ds in request.divergent_spaces
+        )
+        has_mask_in_divergent = any(
+            ds.mask or hasattr(ds, "_generated_mask") for ds in request.divergent_spaces
+        )
 
         target_width, target_height = 1024, 1024
         if has_mask_in_divergent:
             for ds in request.divergent_spaces:
-                if ds.mask and ds.reference:
-                    ref_img = Image.open(ds.reference.file).convert("RGB")
-                    target_width = ref_img.width - (ref_img.width % 8)
-                    target_height = ref_img.height - (ref_img.height % 8)
+                # Get dimensions from generated reference (transform) or uploaded reference
+                ref_src = (
+                    Image.open(ds.reference.file).convert("RGB")
+                    if ds.reference
+                    else None
+                )
+                if ref_src is not None:
+                    target_width = ref_src.width - (ref_src.width % 8)
+                    target_height = ref_src.height - (ref_src.height % 8)
                     break
 
         if has_depth:
@@ -197,8 +264,12 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
             active_depth_scale = 0.5
             for i in range(batch_size):
                 space = request.divergent_spaces[i]
-                if space.depthmap:
-                    img = Image.open(space.depthmap.file).convert("RGB")
+                if space.depthmap or hasattr(space, "_generated_depth"):
+                    # Use generated depth (from transform) or open from UploadFile
+                    if hasattr(space, "_generated_depth"):
+                        img = space._generated_depth.convert("RGB")
+                    else:
+                        img = Image.open(space.depthmap.file).convert("RGB")
                     if has_mask_in_divergent:
                         img = ImageOps.fit(
                             img, (target_width, target_height), method=Image.LANCZOS
@@ -228,8 +299,12 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
             active_canny_scale = 0.4
             for i in range(batch_size):
                 space = request.divergent_spaces[i]
-                if space.canny_edges:
-                    img = Image.open(space.canny_edges.file).convert("RGB")
+                if space.canny_edges or hasattr(space, "_generated_canny"):
+                    # Use generated canny (from transform) or open from UploadFile
+                    if hasattr(space, "_generated_canny"):
+                        img = space._generated_canny.convert("RGB")
+                    else:
+                        img = Image.open(space.canny_edges.file).convert("RGB")
                     if has_mask_in_divergent:
                         img = ImageOps.fit(
                             img, (target_width, target_height), method=Image.LANCZOS
@@ -263,8 +338,14 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
             )
             for i in range(batch_size):
                 space = request.divergent_spaces[i]
-                if space.mask and space.reference:
-                    mask_img = Image.open(space.mask.file).convert("L")
+                has_generated = hasattr(space, "_generated_mask")
+                has_uploaded = space.mask and space.reference
+                if has_generated or has_uploaded:
+                    # Mask: use generated (from transform) or open from UploadFile
+                    if has_generated:
+                        mask_img = space._generated_mask.convert("L")
+                    else:
+                        mask_img = Image.open(space.mask.file).convert("L")
                     mask_img = ImageOps.fit(
                         mask_img, (target_width, target_height), method=Image.LANCZOS
                     )
@@ -272,10 +353,30 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
                         device="cuda", dtype=torch.float16
                     )
 
-                    ref_img = Image.open(space.reference.file).convert("RGB")
+                    # Reference: open from UploadFile
+                    if space.reference:
+                        ref_img = Image.open(space.reference.file).convert("RGB")
+                    else:
+                        continue
                     ref_img = ImageOps.fit(
                         ref_img, (target_width, target_height), method=Image.LANCZOS
                     )
+
+                    # Pre-blend: mix the transform fill into the reference so
+                    # the pipeline denoises from something that already resembles
+                    # the input image.  At transform_strength=1.0, the reference
+                    # becomes the transform image in masked areas.
+                    if hasattr(space, "_transform_fill") and space.transform_strength:
+                        fill_img = ImageOps.fit(
+                            space._transform_fill.convert("RGB"),
+                            (target_width, target_height),
+                            method=Image.LANCZOS,
+                        )
+                        blend_mask = mask_img.point(
+                            lambda p: int(p * space.transform_strength)
+                        )
+                        ref_img = Image.composite(fill_img, ref_img, blend_mask)
+
                     reference_tensor[i] = TF.to_tensor(ref_img).to(
                         device="cuda", dtype=torch.float16
                     )
@@ -341,7 +442,7 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
         "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
         "controlnet_conditioning_scale": control_scales if control_scales else None,
         "num_inference_steps": 8 if request.lightning else 30,
-        "guidance_scale": 1.5 if request.lightning else 7.0,  # Fixed from 'cfg'
+        "guidance_scale": 1.5 if request.lightning else 5.0,  # Fixed from 'cfg'
         "height": target_height if "target_height" in locals() else 1024,
         "width": target_width if "target_width" in locals() else 1024,
         "num_images_per_prompt": num_images,
@@ -360,6 +461,27 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
 
     images = generate_image(**gen_kwargs)
 
+    # Optional img2img refinement pass
+    if request.final_strength and request.final_strength > 0:
+        print(f"🎨 Running img2img refinement (strength={request.final_strength})...")
+        base_pipe = get_pipe(request.model)
+        img2img_pipe = AutoPipelineForImage2Image.from_pipe(base_pipe)
+        for i, img in enumerate(images):
+            images[i] = img2img_pipe(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                image=img,
+                strength=request.final_strength,
+                num_inference_steps=8 if request.lightning else 30,
+                guidance_scale=1.5 if request.lightning else 7.0,
+                generator=torch.Generator(device="cuda").manual_seed(
+                    randint(0, 2**32 - 1)
+                ),
+            ).images[0]
+        del img2img_pipe
+
     t_to_generation = time.monotonic() - t_to_prompt
     breakdown["generation_time"] = t_to_generation
     # record_lora_config(request.model, request.loras)
@@ -369,7 +491,7 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
 
     metrics = {"latency": latency, "throughput": throughput, "breakdown": breakdown}
 
-    if len(images) == 1:
+    if len(images) == 1 and not returnAssets:
         img_buffer = io.BytesIO()
         images[0].save(img_buffer, format="PNG")
         return Response(
@@ -390,6 +512,22 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
             img_buffer = io.BytesIO()
             img.save(img_buffer, format="PNG")
             zip_file.writestr(f"image_{i}.png", img_buffer.getvalue())
+
+        # Include generated spatial assets when requested
+        if returnAssets and request.divergent_spaces:
+            for i, space in enumerate(request.divergent_spaces):
+                if hasattr(space, "_generated_depth"):
+                    buf = io.BytesIO()
+                    space._generated_depth.save(buf, format="PNG")
+                    zip_file.writestr(f"assets/{i}_depth_map.png", buf.getvalue())
+                if hasattr(space, "_generated_canny"):
+                    buf = io.BytesIO()
+                    space._generated_canny.save(buf, format="PNG")
+                    zip_file.writestr(f"assets/{i}_canny_edges.png", buf.getvalue())
+                if hasattr(space, "_generated_mask"):
+                    buf = io.BytesIO()
+                    space._generated_mask.save(buf, format="PNG")
+                    zip_file.writestr(f"assets/{i}_mask.png", buf.getvalue())
 
     return Response(
         content=zip_buffer.getvalue(),

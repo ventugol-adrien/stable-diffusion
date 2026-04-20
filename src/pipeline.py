@@ -1,7 +1,7 @@
 from random import randint
 from diffusers import (
     StableDiffusionXLPipeline,
-    EulerAncestralDiscreteScheduler,
+    DPMSolverMultistepScheduler,
     AutoencoderKL,
 )
 from pathlib import Path
@@ -228,8 +228,11 @@ def get_pipe(model: str = "juggernaut"):
     )
 
     # 4. SCHEDULER OPTIMIZATION
-    # Euler Ancestral is fast and widely compatible.
-    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    # DPM++ 2M SDE — high quality, good convergence at ~25-30 steps.
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config,
+        algorithm_type="sde-dpmsolver++",
+    )
 
     # 5. MEMORY EFFICIENT ATTENTION
     # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)
@@ -246,7 +249,7 @@ def get_pipe(model: str = "juggernaut"):
 
 def get_fast_pipe(model: str = "juggernaut"): ...
 def warmup_pipeline(
-    pipe: StableDiffusionXLPipeline | StableDiffusionXLImg2ImgPipeline,
+    pipe: StableDiffusionXLPipeline,
     width: int = 1024,
     height: int = 1024,
 ):
