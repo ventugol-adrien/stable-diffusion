@@ -16,8 +16,12 @@ _cached_model_name: str | None = None
 DTYPE = torch.float16
 VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
 CWD = Path(os.getcwd())
-MODEL_CACHE_DIR = CWD / "caches" / "models"
-WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
+_SCRATCH = Path("/scratch")
+_CACHE_BASE = (
+    _SCRATCH if (_SCRATCH.is_dir() and os.access(_SCRATCH, os.W_OK)) else CWD / "caches"
+)
+MODEL_CACHE_DIR = _CACHE_BASE / "models"
+WARMED_CONFIGS_FILE = _CACHE_BASE / "warmed_configs.json"
 MODELS_DIR = Path.home() / "sd_models"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -29,7 +33,8 @@ torch.backends.cuda.enable_cudnn_sdp(False)  # also disable cuDNN SDPA backend
 
 def cleanup_resources():
     """
-    Forcefully releases VRAM. Critical for avoiding Linux 6.14 GTT Swap crashes.
+    Forcefully releases ALL VRAM — both the SDXL image pipeline and the Wan
+    video pipelines. Critical for avoiding Linux 6.14 GTT Swap crashes.
     """
     global _cached_pipe, _cached_fast_pipe
 
@@ -41,7 +46,7 @@ def cleanup_resources():
             except Exception:
                 pass
 
-    # Explicitly delete references
+    # Release SDXL image pipeline references
     if _cached_pipe is not None:
         del _cached_pipe
         _cached_pipe = None
@@ -50,7 +55,15 @@ def cleanup_resources():
         del _cached_fast_pipe
         _cached_fast_pipe = None
 
-    # Force Python GC and ROCm cache clear
+    # Release Wan video pipeline references (lazy import avoids circular dependency).
+    try:
+        from src.video import cleanup_wan_resources
+
+        cleanup_wan_resources()
+    except Exception:
+        pass
+
+    # Force Python GC and CUDA cache clear
     gc.collect()
     torch.cuda.empty_cache()
     print("🧹 VRAM resources released.")

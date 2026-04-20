@@ -19,6 +19,21 @@ import torch
 # Disable xet download backend — crashes with "Background writer channel closed"
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 
+# Large tensor caches (model weights, Triton kernels) go to /scratch when available
+# — it has 1.5 TB of free space vs. the root disk which is much smaller.
+_SCRATCH = Path("/scratch")
+_LOCAL_CACHES = Path(__file__).resolve().parent.parent / "caches"
+_CACHE_BASE = (
+    _SCRATCH if (_SCRATCH.is_dir() and os.access(_SCRATCH, os.W_OK)) else _LOCAL_CACHES
+)
+
+# Persist torch.compile Triton kernels across restarts
+_COMPILE_CACHE = _CACHE_BASE / "torch_compile"
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_COMPILE_CACHE))
+
+# Reduce CUDA allocator fragmentation (PyTorch recommendation for large models)
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -54,7 +69,7 @@ _LORA_REGISTRY = {
     },
 }
 
-_CACHES_DIR = Path(__file__).resolve().parent.parent / "caches"
+_CACHES_DIR = _CACHE_BASE
 
 
 def _is_h100() -> bool:
@@ -180,6 +195,75 @@ def _setup_distill_scheduler(pipe):
     pipe.scheduler = euler
 
 
+def _h100_setup(pipe, pipeline_type: str):
+    """H100-only post-load optimizations: TunableOp, LoRA pre-load, torch.compile, warmup."""
+    # ── TunableOp: autotune cuBLAS GEMM kernels for recurring matmul shapes ──
+    tunable_file = _CACHES_DIR / "tunable_ops.csv"
+    try:
+        torch.cuda.tunable.enable(val=True)
+        torch.cuda.tunable.set_filename(str(tunable_file))
+        torch.cuda.tunable.write_file_on_exit(True)
+        logger.info(f"[WAN] TunableOp enabled, cache: {tunable_file}")
+    except Exception as e:
+        logger.warning(f"[WAN] TunableOp not available: {e}")
+
+    # ── Pre-load distill LoRA before compilation ──
+    logger.info(f"[WAN] Pre-loading distill LoRA ({pipeline_type})...")
+    t0 = time.monotonic()
+    _ensure_lora_loaded(pipe, "distill", pipeline_type)
+    pipe.set_adapters(["distill_high", "distill_low"], [1.0, 1.0])
+    logger.info(f"[WAN] LoRA loaded in {time.monotonic() - t0:.1f}s")
+
+    # ── Compile transformer forward methods (not the modules themselves,
+    #    so PEFT adapter registry stays accessible for set_adapters) ──
+    logger.info("[WAN] Compiling transformers with torch.compile (max-autotune)...")
+    t0 = time.monotonic()
+    pipe.transformer.forward = torch.compile(
+        pipe.transformer.forward, mode="max-autotune"
+    )
+    if hasattr(pipe, "transformer_2"):
+        pipe.transformer_2.forward = torch.compile(
+            pipe.transformer_2.forward, mode="max-autotune"
+        )
+    logger.info(f"[WAN] torch.compile setup in {time.monotonic() - t0:.1f}s")
+
+    # ── Warmup: trigger Triton compilation at production resolution ──
+    logger.info(
+        "[WAN] Warming up compiled graph (first run triggers Triton compilation)..."
+    )
+    pipe.scheduler = pipe._distill_scheduler
+    t0 = time.monotonic()
+    with torch.inference_mode():
+        if pipeline_type == "i2v":
+            from PIL import Image as _PIL
+
+            _dummy_img = _PIL.new("RGB", (832, 480), (128, 128, 128))
+            _ = pipe(
+                image=_dummy_img,
+                prompt="warmup",
+                num_inference_steps=2,
+                height=480,
+                width=832,
+                num_frames=9,
+                guidance_scale=1.0,
+                output_type="latent",
+            )
+            del _dummy_img
+        else:
+            _ = pipe(
+                prompt="warmup",
+                num_inference_steps=2,
+                height=480,
+                width=832,
+                num_frames=9,
+                guidance_scale=1.0,
+                output_type="latent",
+            )
+    logger.info(f"[WAN] Warmup done in {time.monotonic() - t0:.1f}s")
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _load_wan_t2v():
     """Load Wan 2.2 T2V A14B MoE pipeline (FP8 on H100, 4-bit NF4 otherwise)."""
     global _wan_t2v_pipe
@@ -279,11 +363,16 @@ def _load_wan_t2v():
 
     pipe.to(device)
     pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
     pipe.register_to_config(boundary_ratio=_BOUNDARY_RATIO)
 
     _setup_distill_scheduler(pipe)
     pipe._loaded_lora_names = set()
-    logger.info("[WAN-T2V] Loaded on GPU + distill scheduler (LoRAs loaded on demand)")
+
+    if h100:
+        _h100_setup(pipe, "t2v")
+
+    logger.info("[WAN-T2V] Pipeline ready")
 
     _wan_t2v_pipe = pipe
     return _wan_t2v_pipe
@@ -392,11 +481,16 @@ def _load_wan_i2v():
 
     pipe.to(device)
     pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
     pipe.register_to_config(boundary_ratio=_BOUNDARY_RATIO)
 
     _setup_distill_scheduler(pipe)
     pipe._loaded_lora_names = set()
-    logger.info("[WAN-I2V] Loaded on GPU + distill scheduler (LoRAs loaded on demand)")
+
+    if h100:
+        _h100_setup(pipe, "i2v")
+
+    logger.info("[WAN-I2V] Pipeline ready")
 
     _wan_i2v_pipe = pipe
     return _wan_i2v_pipe
@@ -466,6 +560,7 @@ async def generate_video(
         """Return a callback_on_step_end that logs progress."""
 
         def _cb(_pipe, step, _timestep, cb_kwargs):
+            print(f"[WAN] step {step + 1}/{total_steps}")
             logger.info(f"[WAN] step {step + 1}/{total_steps}")
             return cb_kwargs
 
@@ -492,12 +587,8 @@ async def generate_video(
     if input_image is not None:
         # ── Image-to-Video (A14B MoE, 4-bit + distill LoRA) ──────────────
         # Free T2V pipeline VRAM if loaded — can't fit both A14B pipelines
-        global _wan_t2v_pipe
         if _wan_t2v_pipe is not None:
-            del _wan_t2v_pipe
-            _wan_t2v_pipe = None
-            gc.collect()
-            torch.cuda.empty_cache()
+            cleanup_wan_resources()
             logger.info("[WAN] Released T2V pipeline to make room for I2V")
         pipe = _load_wan_i2v()
         pipe.register_to_config(boundary_ratio=boundary_ratio)
@@ -541,26 +632,32 @@ async def generate_video(
                 adapter_weights.extend([lora["weight_high"], lora["weight_low"]])
             pipe.set_adapters(adapter_names, adapter_weights)
         else:
-            pipe.disable_lora()
+            # Use zero-weight adapters instead of disable_lora() to preserve
+            # the compiled graph structure (avoids torch.compile recompilation)
+            if "distill" in pipe._loaded_lora_names:
+                pipe.set_adapters(["distill_high", "distill_low"], [0.0, 0.0])
+            else:
+                pipe.disable_lora()
 
         logger.info(f"[WAN] {mode}: generating {width}x{height} @ {n_steps} steps...")
         t0 = time.monotonic()
-        output = pipe(
-            image=input_image,
-            last_image=input_last_image,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            num_inference_steps=n_steps,
-            guidance_scale=cfg,
-            guidance_scale_2=cfg2,
-            generator=generator,
-            output_type="np",
-            return_dict=False,
-            callback_on_step_end=_progress_cb(n_steps),
-        )
+        with torch.inference_mode():
+            output = pipe(
+                image=input_image,
+                last_image=input_last_image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                num_inference_steps=n_steps,
+                guidance_scale=cfg,
+                guidance_scale_2=cfg2,
+                generator=generator,
+                output_type="np",
+                return_dict=False,
+                callback_on_step_end=_progress_cb(n_steps),
+            )
     else:
         # ── Text-to-Video (A14B MoE, 4-bit + distill LoRA) ───────────────
         # Free I2V pipeline VRAM if loaded — can't fit both A14B pipelines
@@ -613,24 +710,30 @@ async def generate_video(
                 adapter_weights.extend([lora["weight_high"], lora["weight_low"]])
             pipe.set_adapters(adapter_names, adapter_weights)
         else:
-            pipe.disable_lora()
+            # Use zero-weight adapters instead of disable_lora() to preserve
+            # the compiled graph structure (avoids torch.compile recompilation)
+            if "distill" in pipe._loaded_lora_names:
+                pipe.set_adapters(["distill_high", "distill_low"], [0.0, 0.0])
+            else:
+                pipe.disable_lora()
 
         logger.info(f"[WAN] {mode}: generating {width}x{height} @ {n_steps} steps...")
         t0 = time.monotonic()
-        output = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=width,
-            height=height,
-            num_frames=num_frames,
-            num_inference_steps=n_steps,
-            guidance_scale=cfg,
-            guidance_scale_2=cfg2,
-            generator=generator,
-            output_type="np",
-            return_dict=False,
-            callback_on_step_end=_progress_cb(n_steps),
-        )
+        with torch.inference_mode():
+            output = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                num_frames=num_frames,
+                num_inference_steps=n_steps,
+                guidance_scale=cfg,
+                guidance_scale_2=cfg2,
+                generator=generator,
+                output_type="np",
+                return_dict=False,
+                callback_on_step_end=_progress_cb(n_steps),
+            )
 
     video_frames = output[0][0]  # (num_frames, H, W, 3) float32 [0,1]
     logger.info(f"[WAN] {mode} done in {time.monotonic() - t0:.1f}s")
