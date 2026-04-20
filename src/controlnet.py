@@ -7,11 +7,15 @@ import numpy as np
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 from transformers import pipeline
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 from controlnet_aux import PidiNetDetector
+from diffusers import AutoPipelineForInpainting
 import traceback
+
+from src.pipeline import get_pipe
+from src.transform import TransformParams, apply_transforms
 
 ANNOTATORS_DIR = Path.home() / "sd_annotators"
 
@@ -378,6 +382,94 @@ async def generate_controlnet_assets(
             media_type="application/json",
             status_code=500,
         )
+
+
+def _outpaint_fill(
+    image: Image.Image,
+    void_mask: Image.Image,
+    prompt: str,
+    model: str = "juggernaut",
+    strength: float = 1.0,
+    num_inference_steps: int = 30,
+    guidance_scale: float = 7.0,
+) -> Image.Image:
+    """
+    Fills void regions of a transformed image using SDXL inpainting.
+
+    Converts the cached base pipeline to an inpainting pipeline via
+    from_pipe() (shares weights, no extra VRAM), runs inpainting on the
+    void mask, and returns the filled image.
+    """
+    base_pipe = get_pipe(model)
+    inpaint_pipe = AutoPipelineForInpainting.from_pipe(base_pipe)
+
+    rgb_image = image.convert("RGB") if image.mode != "RGB" else image
+
+    # Ensure dimensions are multiples of 8 (required by VAE)
+    w, h = rgb_image.size
+    w8 = w - (w % 8)
+    h8 = h - (h % 8)
+    if (w8, h8) != (w, h):
+        rgb_image = rgb_image.crop((0, 0, w8, h8))
+        void_mask = void_mask.crop((0, 0, w8, h8))
+
+    result = inpaint_pipe(
+        prompt=prompt,
+        image=rgb_image,
+        mask_image=void_mask,
+        strength=strength,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        width=w8,
+        height=h8,
+    ).images[0]
+
+    return result
+
+
+@router.post("/transform", response_class=Response)
+async def transform_image(
+    input_image: UploadFile = File(...),
+    dx: int = Form(0),
+    dy: int = Form(0),
+    z: float = Form(1.0),
+    r: float = Form(0.0),
+    prompt: str = Form(None),
+    model: str = Form("juggernaut"),
+    strength: float = Form(1.0),
+):
+    """
+    Spatially transforms an image (scale, rotate, displace) and optionally
+    fills void regions via SDXL outpainting when a prompt is provided.
+
+    Without a prompt, returns the transformed image with black voids.
+    """
+    img_bytes = await input_image.read()
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+    except UnidentifiedImageError:
+        return Response(
+            content='{"success": false, "message": "File is not a valid image."}',
+            media_type="application/json",
+            status_code=400,
+        )
+
+    params = TransformParams(dx=dx, dy=dy, z=z, r=r)
+    transformed, void_mask = apply_transforms(img, params)
+
+    # Outpaint fill: only when caller provides a prompt and image is RGB
+    if prompt and transformed.mode == "RGB":
+        transformed = _outpaint_fill(
+            transformed, void_mask, prompt, model=model, strength=strength
+        )
+
+    buf = io.BytesIO()
+    transformed.save(buf, format="PNG")
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/png",
+        headers={"Content-Disposition": "inline; filename=transformed.png"},
+    )
 
 
 @router.post("/process-mask", response_class=Response)

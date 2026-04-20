@@ -9,19 +9,20 @@ A high-performance SDXL image generation API built with **FastAPI**, optimized f
 - **LoRA support** — load one or more LoRA adapters per request with independent scale control
 - **Automatic model caching** — first load converts single-file `.safetensors` to diffusers format for ~3× faster subsequent loads
 - **Pipeline warmup on startup** — MIOpen, Triton, and TunableOp caches are populated at boot, eliminating cold-start latency
+- **Spatial transforms + outpainting** — translate, scale, rotate images/masks with optional SDXL inpainting to fill void regions
 - **Batched output** — multiple images per request, packaged as a ZIP with embedded `metrics.json`
 - **CORS-configurable** — origin allowlist via environment variable
 
 ## Requirements
 
-| Dependency | Purpose |
-|---|---|
-| Python 3.10+ | Runtime |
-| PyTorch (ROCm) | GPU compute |
-| [Diffusers](https://github.com/huggingface/diffusers) ≥ 0.36 | SDXL pipeline |
-| [Compel](https://github.com/damian0815/compel) | Prompt weighting / conditioning |
-| [FastAPI](https://fastapi.tiangolo.com/) | HTTP server |
-| CUDA / ROCm compatible GPU | Inference (RDNA 4 optimized) |
+| Dependency                                                   | Purpose                         |
+| ------------------------------------------------------------ | ------------------------------- |
+| Python 3.10+                                                 | Runtime                         |
+| PyTorch (ROCm)                                               | GPU compute                     |
+| [Diffusers](https://github.com/huggingface/diffusers) ≥ 0.36 | SDXL pipeline                   |
+| [Compel](https://github.com/damian0815/compel)               | Prompt weighting / conditioning |
+| [FastAPI](https://fastapi.tiangolo.com/)                     | HTTP server                     |
+| CUDA / ROCm compatible GPU                                   | Inference (RDNA 4 optimized)    |
 
 ## Project Structure
 
@@ -36,7 +37,9 @@ A high-performance SDXL image generation API built with **FastAPI**, optimized f
     ├── models.py            # Pydantic request/response schemas
     ├── pipeline.py          # Pipeline loading, caching, warmup, generation
     ├── loras.py             # LoRA loading and adapter management
-    └── prompt.py            # Prompt pre-processing and quality tags
+    ├── prompt.py            # Prompt pre-processing and quality tags
+    ├── controlnet.py        # ControlNet asset generation and spatial transform endpoint
+    └── transform.py         # Pure spatial transforms (scale, rotate, displace)
 ```
 
 ## Setup
@@ -74,11 +77,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `DEFAULT_MODEL` | `juggernaut` | Model loaded on startup |
-| `ORIGINS` | `[]` | JSON array of allowed CORS origins |
-| `SKIP_PIPELINE_WARMUP` | `0` | Set to `1` to skip warmup on boot |
+| Variable               | Default      | Description                        |
+| ---------------------- | ------------ | ---------------------------------- |
+| `DEFAULT_MODEL`        | `juggernaut` | Model loaded on startup            |
+| `ORIGINS`              | `[]`         | JSON array of allowed CORS origins |
+| `SKIP_PIPELINE_WARMUP` | `0`          | Set to `1` to skip warmup on boot  |
 
 ## API
 
@@ -88,17 +91,17 @@ Generate one or more images from a text prompt.
 
 **Request body** (`application/json`):
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `user_input` | `string` | *(required)* | Text prompt |
-| `model` | `string` | `$DEFAULT_MODEL` | Model identifier |
-| `loras` | `array` | `[]` | LoRA adapters `[{"name": "...", "scale": 0.5}]` |
-| `lightning` | `boolean` | `false` | Use lightning mode (8 steps, CFG 1.5) |
-| `batch_size` | `integer` | `1` | Number of images to generate |
-| `reference` | `bytes` | `null` | Reference image for img2img |
-| `reference_strength` | `float` | `null` | Strength for img2img denoising |
-| `image_seed` | `integer` | `-1` | Seed for generation (`-1` = random) |
-| `prompt_seed` | `integer` | `-1` | Seed for prompt processing |
+| Field                | Type      | Default          | Description                                     |
+| -------------------- | --------- | ---------------- | ----------------------------------------------- |
+| `user_input`         | `string`  | _(required)_     | Text prompt                                     |
+| `model`              | `string`  | `$DEFAULT_MODEL` | Model identifier                                |
+| `loras`              | `array`   | `[]`             | LoRA adapters `[{"name": "...", "scale": 0.5}]` |
+| `lightning`          | `boolean` | `false`          | Use lightning mode (8 steps, CFG 1.5)           |
+| `batch_size`         | `integer` | `1`              | Number of images to generate                    |
+| `reference`          | `bytes`   | `null`           | Reference image for img2img                     |
+| `reference_strength` | `float`   | `null`           | Strength for img2img denoising                  |
+| `image_seed`         | `integer` | `-1`             | Seed for generation (`-1` = random)             |
+| `prompt_seed`        | `integer` | `-1`             | Seed for prompt processing                      |
 
 **Response** (`application/zip`):
 
@@ -116,10 +119,31 @@ The ZIP archive contains:
     "pipeline_load_time": 0.001,
     "lora_load_time": 0.0,
     "prompt_processing_time": 0.12,
-    "generation_time": 4.70
+    "generation_time": 4.7
   }
 }
 ```
+
+### `POST /spatial-assets/transform`
+
+Spatially transform an image (scale, rotate, displace) with optional SDXL outpainting to fill void regions.
+
+**Request body** (`multipart/form-data`):
+
+| Field         | Type      | Default      | Description                                             |
+| ------------- | --------- | ------------ | ------------------------------------------------------- |
+| `input_image` | `file`    | _(required)_ | Image file to transform                                 |
+| `dx`          | `integer` | `0`          | X-axis displacement in pixels                           |
+| `dy`          | `integer` | `0`          | Y-axis displacement in pixels                           |
+| `z`           | `float`   | `1.0`        | Zoom/scale factor (0.1–5.0)                             |
+| `r`           | `float`   | `0.0`        | Rotation angle in degrees (-360–360)                    |
+| `prompt`      | `string`  | `null`       | Text prompt for outpainting (omit to leave voids black) |
+| `model`       | `string`  | `juggernaut` | Model identifier for outpainting                        |
+| `strength`    | `float`   | `1.0`        | Inpainting denoising strength                           |
+
+**Response** (`image/png`):
+
+The transformed image as a PNG. When `prompt` is provided and the input is an RGB image, void regions created by the transform are filled using SDXL inpainting. Without a prompt (or for grayscale masks), voids are left black.
 
 ### `GET /models/`
 
