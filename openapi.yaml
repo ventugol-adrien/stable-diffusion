@@ -3,13 +3,551 @@ info:
   title: Stable Diffusion XL Inference Server
   description: >
     High-performance SDXL image generation API optimized for AMD RDNA 4 GPUs.
-    Supports text-to-image, image-to-image, LoRA adapters, and lightning mode.
-  version: 1.0.0
+    Supports text-to-image, image-to-image, LoRA adapters, ControlNet depth/canny
+    priors, divergent-space per-image inpainting, IP-Adapter style transfer,
+    PAG quality enhancement, and a true 4x Real-ESRGAN + tiled SGM Uniform
+    high-resolution fix pass.
+  version: 2.0.0
   license:
     name: Proprietary
 servers:
   - url: http://localhost:8000
     description: Local development server
+
+paths:
+  /generate/image:
+    post:
+      operationId: generateImage
+      summary: Generate images from a text prompt
+      description: >
+        Generates one or more SDXL images based on the provided prompt and
+        parameters.
+
+        Returns `image/png` for `batch_size=1`, or an `application/zip` archive
+        for larger batches. Add `?returnAssets=true` to include generated depth
+        maps, canny edges, and masks inside the ZIP under `assets/`.
+
+        All file fields use `multipart/form-data`. Divergent-space fields are
+        sent as indexed prefixes: `0.<field>`, `1.<field>`, etc.
+      parameters:
+        - name: returnAssets
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: >
+            Include generated spatial assets (depth maps, canny edges, masks)
+            inside the ZIP response under `assets/`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ImageRequest"
+            examples:
+              simple_t2i:
+                summary: Simple text-to-image
+                value:
+                  user_input: "a photorealistic portrait of a woman in golden hour light"
+              hr_fix:
+                summary: Text-to-image with high-resolution fix
+                value:
+                  user_input: "a photorealistic portrait of a woman in golden hour light"
+                  final_strength: 0.25
+              lightning:
+                summary: Fast lightning-mode generation
+                value:
+                  user_input: "cyberpunk cityscape at night"
+                  lightning: true
+                  batch_size: 2
+              with_loras:
+                summary: Generation with LoRA adapters
+                value:
+                  user_input: "portrait of a woman in a garden"
+                  model: "juggernaut"
+                  loras: '[{"name": "detail_enhancer", "scale": 0.7}]'
+              divergent_spatial:
+                summary: Single-slot divergent space with spatial transform
+                value:
+                  user_input: "cinematic interior, cozy living room"
+                  batch_size: 1
+                  "0.reference": "<binary>"
+                  "0.transform.input_image": "<binary>"
+                  "0.transform.dx": 80
+                  "0.transform.z": 0.95
+                  "0.transform_strength": 0.7
+                  "0.strength": 0.85
+                  final_strength: 0.25
+      responses:
+        "200":
+          description: >
+            Generated image(s). Single image returned as `image/png`.
+            Multiple images returned as `application/zip` containing
+            `image_0.png … image_N.png` and `metrics.json`.
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
+                description: >
+                  ZIP file containing:
+                  - `metrics.json` with latency, throughput, and timing breakdown
+                  - `image_0.png`, `image_1.png`, ... for each generated image
+                  - `assets/<i>_depth_map.png` etc. when `returnAssets=true`
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: "inline; filename=result.png"
+            X-Metrics-Latency:
+              schema:
+                type: string
+              description: Total wall-clock time in seconds (single-image response only).
+            X-Metrics-Throughput:
+              schema:
+                type: string
+              description: Images per second (single-image response only).
+            X-Metrics-Breakdown:
+              schema:
+                type: string
+              description: JSON-encoded timing breakdown (single-image response only).
+        "400":
+          description: >
+            Request validation error (e.g. divergent_spaces count ≠ batch_size).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+        "422":
+          description: Pydantic validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+
+  /spatial-assets/transform:
+    post:
+      operationId: transformImage
+      summary: Spatially transform an image with automatic void filling
+      description: >
+        Applies spatial transforms (scale, rotate, displace) to an image.
+        Uses RGBA alpha tracking to precisely identify void regions.
+
+        Void regions in RGB images are automatically filled using LaMa
+        inpainting (fast, deterministic structural continuation).
+
+        Non-RGB images (e.g. grayscale masks) are returned with black voids.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - input_image
+              properties:
+                input_image:
+                  type: string
+                  format: binary
+                  description: The image file to transform.
+                dx:
+                  type: integer
+                  default: 0
+                  description: X-axis displacement in pixels.
+                dy:
+                  type: integer
+                  default: 0
+                  description: Y-axis displacement in pixels.
+                z:
+                  type: number
+                  format: float
+                  default: 1.0
+                  minimum: 0.1
+                  maximum: 5.0
+                  description: Zoom/scale factor (1.0 = no change).
+                r:
+                  type: number
+                  format: float
+                  default: 0.0
+                  minimum: -360.0
+                  maximum: 360.0
+                  description: Rotation angle in degrees.
+            examples:
+              shift_right:
+                summary: Shift image right, LaMa fills void
+                value:
+                  dx: 100
+              scale_rotate:
+                summary: Zoom out and rotate, LaMa fills edges
+                value:
+                  z: 0.7
+                  r: 15.0
+      responses:
+        "200":
+          description: Transformed PNG image
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: "inline; filename=transformed.png"
+        "400":
+          description: Invalid image file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+                    example: "File is not a valid image."
+        "422":
+          description: Validation error (e.g. z out of range)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
+
+  /models:
+    get:
+      operationId: listModels
+      summary: List available models
+      description: >
+        Returns an array of model identifiers available for generation.
+        Each identifier corresponds to a `.safetensors` file in the models
+        directory.
+      responses:
+        "200":
+          description: Array of model identifier strings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+              example: ["juggernaut", "pony"]
+
+components:
+  schemas:
+    LoRA:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: >
+            LoRA adapter filename (without `.safetensors` extension) located
+            in the `~/sd_loras/` directory.
+          example: "detail_enhancer"
+        scale:
+          type: number
+          format: float
+          default: 0.5
+          minimum: 0
+          maximum: 2
+          description: Adapter influence scale.
+          example: 0.7
+
+    DivergentSpace:
+      type: object
+      description: >
+        Per-batch-slot configuration for divergent-space ControlNet inpainting.
+        Fields are submitted as multipart form keys prefixed with the slot index,
+        e.g. `0.reference`, `0.transform.dx`.
+      properties:
+        reference:
+          type: string
+          format: binary
+          description: Base image for this batch slot (inpainting target).
+        mask:
+          type: string
+          format: binary
+          description: >
+            Grayscale inpainting mask. White (255) = inpaint region,
+            black (0) = preserve original.
+        strength:
+          type: number
+          format: float
+          default: 1.0
+          minimum: 0.0
+          maximum: 1.0
+          description: Inpainting denoising strength for this slot.
+        depth_map:
+          type: string
+          format: binary
+          description: Per-slot depth prior image.
+        depth_map_scale:
+          type: number
+          format: float
+          default: 0.6
+          description: ControlNet conditioning scale for this slot's depth prior.
+        canny_edges:
+          type: string
+          format: binary
+          description: Per-slot canny edge prior image.
+        canny_edges_scale:
+          type: number
+          format: float
+          default: 0.2
+          description: ControlNet conditioning scale for this slot's canny prior.
+        ip_image:
+          type: string
+          format: binary
+          description: Per-slot IP-Adapter reference image.
+        ip_scale:
+          type: number
+          format: float
+          nullable: true
+          description: Per-slot IP-Adapter influence scale.
+        transform.input_image:
+          type: string
+          format: binary
+          description: >
+            Source image for spatial transform. When provided, depth and canny
+            priors are generated automatically from the LaMa-filled result,
+            and the transform void becomes the inpainting mask.
+        transform.dx:
+          type: integer
+          default: 0
+          description: X-axis displacement in pixels.
+        transform.dy:
+          type: integer
+          default: 0
+          description: Y-axis displacement in pixels.
+        transform.z:
+          type: number
+          format: float
+          default: 1.0
+          description: Zoom/scale factor (1.0 = no change).
+        transform.r:
+          type: number
+          format: float
+          default: 0.0
+          description: Rotation angle in degrees.
+        transform_strength:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0.0
+          maximum: 1.0
+          description: >
+            How strongly the LaMa transform fill is pre-blended into the
+            reference image inside the mask before denoising. 0.0 = no blend
+            (reference unchanged), 1.0 = fill fully replaces reference in
+            masked region. Recommended: 0.5–0.8.
+
+    ImageRequest:
+      type: object
+      required:
+        - user_input
+      description: >
+        All file fields are multipart binary uploads. Divergent-space fields
+        are submitted with an integer slot prefix: `0.<field>`, `1.<field>`, etc.
+      properties:
+        user_input:
+          type: string
+          description: Text prompt describing the desired image.
+          example: "a photorealistic portrait of a woman in golden hour light"
+        model:
+          type: string
+          default: "juggernaut"
+          description: >
+            Model identifier matching a `.safetensors` filename in `~/sd_models/`.
+          example: "juggernaut"
+        loras:
+          type: string
+          default: "[]"
+          description: >
+            JSON-encoded array of LoRA adapter objects.
+            Example: `[{"name": "detail_enhancer", "scale": 0.7}]`
+          example: '[{"name": "detail_enhancer", "scale": 0.7}]'
+        lightning:
+          type: boolean
+          default: false
+          description: >
+            Enable lightning mode (8 steps, CFG 1.5) instead of standard
+            mode (30 steps, CFG 5.0).
+        batch_size:
+          type: integer
+          default: 1
+          minimum: 1
+          description: Number of images to generate per request.
+        image_seed:
+          type: integer
+          default: -1
+          description: Seed for the generation RNG. Use `-1` for random.
+        prompt_seed:
+          type: integer
+          default: -1
+          description: Seed for prompt processing RNG. Use `-1` for random.
+        reference:
+          type: string
+          format: binary
+          nullable: true
+          description: >
+            Global reference image for img2img. LANCZOS-fit to 1024×1024.
+            Requires `strength` to take effect.
+        strength:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0.0
+          maximum: 1.0
+          description: Denoising strength for the global img2img reference pass.
+        depth_map:
+          type: string
+          format: binary
+          nullable: true
+          description: >
+            Global depth map for Xinsir SDXL depth ControlNet. Applied to all
+            batch slots uniformly.
+        depth_scales:
+          type: array
+          items:
+            type: number
+            format: float
+          default: []
+          description: >
+            Conditioning scale(s) for the global depth ControlNet.
+            Repeat the field for multiple values.
+        canny_edges:
+          type: string
+          format: binary
+          nullable: true
+          description: >
+            Global canny edge map for Xinsir SDXL canny ControlNet. Applied to
+            all batch slots uniformly.
+        canny_edges_scales:
+          type: array
+          items:
+            type: number
+            format: float
+          default: []
+          description: >
+            Conditioning scale(s) for the global canny ControlNet.
+        ip_image:
+          type: string
+          format: binary
+          nullable: true
+          description: Global IP-Adapter reference image for style transfer.
+        ip_scale:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0.0
+          maximum: 1.0
+          description: Global IP-Adapter influence scale.
+        final_strength:
+          type: number
+          format: float
+          nullable: true
+          minimum: 0.0
+          maximum: 1.0
+          description: >
+            Trigger a true 4x high-resolution fix pass after generation.
+
+            Pipeline:
+            1. 4× Real-ESRGAN pixel-space upscale (RealESRGAN_x4plus, tile=512)
+            2. Split the upscaled image into overlapping 1024×1024 tiles
+            3. 30-step SGM Uniform DPM++ 2M SDE img2img on each tile
+            4. Feather-blend the refined tiles into the final 4× image
+
+            The value is internally clamped to [0.15, 0.40].
+            **Recommended range: 0.20–0.30.** Values outside this range produce
+            either no change (<0.15) or visible tile drift (>0.40).
+          example: 0.25
+        divergent_spaces:
+          type: array
+          items:
+            $ref: "#/components/schemas/DivergentSpace"
+          default: []
+          description: >
+            Per-batch-slot inpainting configurations. Length must equal
+            `batch_size`. Submitted as indexed multipart keys:
+            `0.reference`, `0.mask`, `1.reference`, `1.mask`, etc.
+
+    GenerationMetrics:
+      type: object
+      description: Performance metrics included in the response ZIP as `metrics.json`.
+      properties:
+        latency:
+          type: number
+          format: float
+          description: Total wall-clock time in seconds.
+          example: 4.82
+        throughput:
+          type: number
+          format: float
+          description: Images per second.
+          example: 0.207
+        breakdown:
+          type: object
+          properties:
+            pipeline_load_time:
+              type: number
+              format: float
+              description: Time to load or retrieve the cached pipeline.
+              example: 0.001
+            lora_load_time:
+              type: number
+              format: float
+              description: Time to load LoRA adapters.
+              example: 0.0
+            prompt_processing_time:
+              type: number
+              format: float
+              description: Time for prompt conditioning via Compel.
+              example: 0.12
+            generation_time:
+              type: number
+              format: float
+              description: Time for diffusion inference, VAE decode, and HR fix.
+              example: 4.70
+
+    ValidationError:
+      type: object
+      required:
+        - loc
+        - msg
+        - type
+      properties:
+        loc:
+          type: array
+          items:
+            anyOf:
+              - type: string
+              - type: integer
+          description: Location of the error in the request.
+        msg:
+          type: string
+          description: Human-readable error message.
+        type:
+          type: string
+          description: Error type identifier.
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationError"
 
 paths:
   /generate/image/:

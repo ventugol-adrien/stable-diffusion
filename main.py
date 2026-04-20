@@ -1,7 +1,6 @@
 import base64
 from contextlib import asynccontextmanager
 import io, os, json, time
-from random import randint
 from pathlib import Path
 import zipfile
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -10,11 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.models import ImageRequest
 from compel import CompelForSDXL
 from diffusers import (
-    AutoPipelineForImage2Image,
     StableDiffusionXLControlNetPipeline,
     StableDiffusionXLControlNetInpaintPipeline,
-    ControlNetModel,
 )
+from diffusers.pipelines.pag import StableDiffusionXLPAGImg2ImgPipeline
 from PIL import Image, ImageOps
 
 from src.pipeline import (
@@ -24,12 +22,19 @@ from src.pipeline import (
     generate_image,
     shutdown,
     MODEL_CACHE_DIR,
+    get_controlnet_model,
+    load_ip_adapter_local,
+    try_enable_pag,
+    configure_sgm_uniform_scheduler,
+    apply_filmic_finish,
 )
 from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
 
 from src.controlnet import router as depthmap_router, get_asset_generator
+from src.hr_fix import tiled_refine_image
 from src.transform import TransformParams, apply_transforms, lama_fill
+from src.upscaler import upscale_image
 
 import torch
 
@@ -122,7 +127,8 @@ def handle_generate_image(
         init_image = Image.open(request.reference.file).convert("RGB")
 
         init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
-        pipe = AutoPipelineForImage2Image.from_pipe(pipe)
+        pipe = StableDiffusionXLPAGImg2ImgPipeline.from_pipe(pipe)
+        try_enable_pag(pipe, context="global img2img")
 
     # 1. Initialize dynamic lists for Multi-ControlNet
     controlnets = []
@@ -136,9 +142,7 @@ def handle_generate_image(
         depthmap_img = ImageOps.fit(depthmap_img, (1024, 1024), method=Image.LANCZOS)
         control_images.append(depthmap_img)
         controlnets.append(
-            ControlNetModel.from_pretrained(
-                "xinsir/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16
-            )
+            get_controlnet_model("xinsir/controlnet-depth-sdxl-1.0", "depth_sdxl")
         )
         control_scales.append(
             request.depth_scales[0] if request.depth_scales else 0.5
@@ -151,9 +155,7 @@ def handle_generate_image(
         canny_img = ImageOps.fit(canny_img, (1024, 1024), method=Image.LANCZOS)
         control_images.append(canny_img)
         controlnets.append(
-            ControlNetModel.from_pretrained(
-                "xinsir/controlnet-canny-sdxl-1.0", torch_dtype=torch.float16
-            )
+            get_controlnet_model("xinsir/controlnet-canny-sdxl-1.0", "canny_sdxl")
         )
         control_scales.append(
             request.edges_scales[0] if request.edges_scales else 0.4
@@ -283,9 +285,7 @@ def handle_generate_image(
                     if space.depthmap_scale is not None:
                         active_depth_scale = space.depthmap_scale
             controlnets.append(
-                ControlNetModel.from_pretrained(
-                    "xinsir/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16
-                )
+                get_controlnet_model("xinsir/controlnet-depth-sdxl-1.0", "depth_sdxl")
             )
             control_images.append(depth_tensor)
             control_scales.append(active_depth_scale)
@@ -318,9 +318,7 @@ def handle_generate_image(
                     if space.edges_scale is not None:
                         active_canny_scale = space.edges_scale
             controlnets.append(
-                ControlNetModel.from_pretrained(
-                    "xinsir/controlnet-canny-sdxl-1.0", torch_dtype=torch.float16
-                )
+                get_controlnet_model("xinsir/controlnet-canny-sdxl-1.0", "canny_sdxl")
             )
             control_images.append(canny_tensor)
             control_scales.append(active_canny_scale)
@@ -401,21 +399,13 @@ def handle_generate_image(
                 controlnet=controlnets,
                 torch_dtype=torch.float16,
             ).to("cuda")
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
+        try_enable_pag(pipe, context="controlnet generation")
 
         # Note: During the actual generation call (pipe(...)), you MUST pass:
         # image=control_images
         # controlnet_conditioning_scale=control_scales
-
-        # 5. IP-Adapter Integration
-        if request.ip_adapter_image and request.ip_adapter_scale:
-            print("🧩 IP-Adapter image and scale provided, adding to pipeline...")
-            ip_adapter_image = Image.open(request.ip_adapter_image.file).convert("RGB")
-            pipe.load_ip_adapter(
-                "h94/IP-Adapter",
-                subfolder="sdxl_models",
-                weight_name="ip-adapter_sdxl.bin",
-            )
-            pipe.set_ip_adapter_scale(request.ip_adapter_scale)
 
     # When ControlNets are active with batch_size > 1, the control image tensors
     # already carry the batch dimension. Expand prompt embeds to match and set
@@ -434,57 +424,131 @@ def handle_generate_image(
         )
         num_images = 1
 
+    # IP-Adapter: load weights on the base PAG pipe when an ip_adapter_image is
+    # provided, regardless of whether ControlNets are active.
+    ip_adapter_image = None
+    if request.ip_adapter_image and request.ip_adapter_scale:
+        print("🧩 IP-Adapter image and scale provided, loading onto base pipe...")
+        ip_adapter_image = Image.open(request.ip_adapter_image.file).convert("RGB")
+        if not controlnets:
+            # For ControlNet paths the pipe was freshly built above; reload
+            # IP-Adapter there. For the base PAG path, get_pipe handles it.
+            pipe = get_pipe(request.model, load_ip_adapter=True)
+        else:
+            load_ip_adapter_local(pipe)
+
     gen_kwargs = {
         "pipe": pipe,
         "prompt_embeds": prompt_embeds,
         "pooled_prompt_embeds": pooled_prompt_embeds,
         "negative_prompt_embeds": negative_prompt_embeds,
         "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
-        "controlnet_conditioning_scale": control_scales if control_scales else None,
         "num_inference_steps": 8 if request.lightning else 30,
-        "guidance_scale": 1.5 if request.lightning else 5.0,  # Fixed from 'cfg'
+        "guidance_scale": 1.5 if request.lightning else 5.0,
         "height": target_height if "target_height" in locals() else 1024,
         "width": target_width if "target_width" in locals() else 1024,
         "num_images_per_prompt": num_images,
-        "ip_adapter_image": ip_adapter_image if request.ip_adapter_image else None,
-        "control_guidance_end_step": 0.5,
         "seed": request.image_seed,
     }
+    if controlnets:
+        gen_kwargs["controlnet_conditioning_scale"] = control_scales
+        gen_kwargs["control_guidance_end"] = 0.5
+    if ip_adapter_image is not None:
+        gen_kwargs["ip_adapter_image"] = ip_adapter_image
+        gen_kwargs["ip_adapter_scale"] = request.ip_adapter_scale
 
     if has_mask_in_divergent:
         gen_kwargs["image"] = reference_tensor
         gen_kwargs["mask_image"] = mask_tensor
         gen_kwargs["control_image"] = control_images if control_images else None
         gen_kwargs["strength"] = active_mask_strength
-    else:
-        gen_kwargs["image"] = control_images if control_images else None
+    elif control_images:
+        # ControlNet (non-inpainting): pass control images as image
+        gen_kwargs["image"] = control_images
+    elif init_image is not None:
+        # Global img2img reference (no ControlNet)
+        gen_kwargs["image"] = init_image
+        gen_kwargs["strength"] = request.strength or 0.75
 
     images = generate_image(**gen_kwargs)
 
     # Optional img2img refinement pass
     if request.final_strength and request.final_strength > 0:
-        print(f"🎨 Running img2img refinement (strength={request.final_strength})...")
+        print(f"🎨 Running High-Resolution Fix (strength={request.final_strength})...")
         base_pipe = get_pipe(request.model)
-        img2img_pipe = AutoPipelineForImage2Image.from_pipe(base_pipe)
+        img2img_pipe = StableDiffusionXLPAGImg2ImgPipeline.from_pipe(base_pipe)
+        img2img_pipe.vae.enable_tiling()
+        img2img_pipe.vae.enable_slicing()
+        try_enable_pag(img2img_pipe, context="img2img refinement")
+        # Explicitly zero IP-Adapter on the refinement pipe so it cannot drift
+        # the subject composition during the texture recovery pass.
+        try:
+            img2img_pipe.set_ip_adapter_scale(0.0)
+        except Exception:
+            pass  # IP-Adapter not loaded on this pipe — nothing to do
+        configure_sgm_uniform_scheduler(img2img_pipe)
+        safe_strength = min(max(request.final_strength, 0.01), 0.40)
+        refine_pag_scale = (
+            3.0 if getattr(img2img_pipe, "pag_attn_processors", None) else None
+        )
+
+        # Use a detail-focused prompt for tiled refinement so the pass recovers
+        # texture and sharpness rather than drifting the subject composition.
+        _REFINE_POSITIVE = (
+            "highly detailed, accurate textures, sharp focus, intricate surface detail, "
+            "photorealistic++, crisp edges, fine grain, high frequency detail, realistic lighting++"
+        )
+        _REFINE_NEGATIVE = "blurry, soft focus, low detail, low resolution, smeared, watercolor, painterly, plastic look, bad lighting"
+        refine_compel = CompelForSDXL(pipe=img2img_pipe, device="cuda")
+        refine_conditioning = refine_compel(
+            _REFINE_POSITIVE, negative_prompt=_REFINE_NEGATIVE
+        )
+        refine_prompt_embeds = refine_conditioning.embeds
+        refine_pooled_prompt_embeds = refine_conditioning.pooled_embeds
+        refine_negative_prompt_embeds = refine_conditioning.negative_embeds
+        refine_negative_pooled_prompt_embeds = (
+            refine_conditioning.negative_pooled_embeds
+        )
+
         for i, img in enumerate(images):
-            images[i] = img2img_pipe(
-                prompt_embeds=prompt_embeds,
-                pooled_prompt_embeds=pooled_prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-                image=img,
-                strength=request.final_strength,
-                num_inference_steps=8 if request.lightning else 30,
-                guidance_scale=1.5 if request.lightning else 7.0,
-                generator=torch.Generator(device="cuda").manual_seed(
-                    randint(0, 2**32 - 1)
-                ),
-            ).images[0]
-        del img2img_pipe
+            upscaled = upscale_image(img, outscale=4)
+            refined = tiled_refine_image(
+                upscaled,
+                img2img_pipe,
+                prompt_embeds=refine_prompt_embeds,
+                pooled_prompt_embeds=refine_pooled_prompt_embeds,
+                negative_prompt_embeds=refine_negative_prompt_embeds,
+                negative_pooled_prompt_embeds=refine_negative_pooled_prompt_embeds,
+                strength=safe_strength,
+                num_inference_steps=30,
+                guidance_scale=1.5 if request.lightning else 5.0,
+                pag_scale=refine_pag_scale,
+            )
+            images[i] = refined
+        del img2img_pipe, refine_compel
 
     t_to_generation = time.monotonic() - t_to_prompt
     breakdown["generation_time"] = t_to_generation
     # record_lora_config(request.model, request.loras)
+
+    _RESOLUTION_HEIGHT = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080}
+    target_h = _RESOLUTION_HEIGHT[request.resolution]
+    gen_w = target_width if "target_width" in locals() else 1024
+    gen_h = target_height if "target_height" in locals() else 1024
+    images = [
+        (
+            apply_filmic_finish(
+                img.resize(
+                    (round(img.width * target_h / img.height), target_h),
+                    Image.LANCZOS,
+                ),
+                request.grain_intensity,
+            )
+            if img.height > target_h
+            else apply_filmic_finish(img, request.grain_intensity)
+        )
+        for img in images
+    ]
 
     latency = time.monotonic() - start_time
     throughput = request.batch_size / latency if latency > 0 else 0

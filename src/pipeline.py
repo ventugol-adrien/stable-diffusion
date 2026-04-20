@@ -1,8 +1,10 @@
 from random import randint
 from diffusers import (
     StableDiffusionXLPipeline,
+    StableDiffusionXLPAGPipeline,
     DPMSolverMultistepScheduler,
     AutoencoderKL,
+    ControlNetModel,
 )
 from pathlib import Path
 from urllib.parse import urlparse
@@ -12,6 +14,7 @@ import cv2
 import torch
 from PIL import Image
 from torch.hub import download_url_to_file, get_dir
+from huggingface_hub import snapshot_download
 
 _cached_pipe: StableDiffusionXLPipeline | None = None
 _cached_fast_pipe: StableDiffusionXLPipeline | None = None
@@ -21,6 +24,11 @@ DTYPE = torch.float16
 VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
 CWD = Path(os.getcwd())
 MODEL_CACHE_DIR = CWD / "caches" / "models"
+ARTIFACTS_CACHE_DIR = CWD / "caches" / "artifacts"
+HF_LOCAL_CACHE_DIR = ARTIFACTS_CACHE_DIR / "huggingface"
+CONTROLNET_LOCAL_CACHE_DIR = ARTIFACTS_CACHE_DIR / "controlnet"
+IP_ADAPTER_LOCAL_CACHE_DIR = ARTIFACTS_CACHE_DIR / "ip_adapter"
+VAE_LOCAL_CACHE_DIR = ARTIFACTS_CACHE_DIR / "vae_fp16_fix"
 WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
 MODELS_DIR = Path.home() / "sd_models"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
@@ -159,53 +167,218 @@ def cleanup_resources():
     print("🧹 VRAM resources released.")
 
 
-def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
+def _ensure_cache_dirs():
+    for p in (
+        MODEL_CACHE_DIR,
+        ARTIFACTS_CACHE_DIR,
+        HF_LOCAL_CACHE_DIR,
+        CONTROLNET_LOCAL_CACHE_DIR,
+        IP_ADAPTER_LOCAL_CACHE_DIR,
+    ):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_hf_repo_once(
+    repo_id: str,
+    local_dir: Path,
+    allow_patterns: list[str] | None = None,
+) -> Path:
+    _ensure_cache_dirs()
+    if local_dir.exists() and any(local_dir.iterdir()):
+        print(f"📦 Using local cached repo: {local_dir}")
+        return local_dir
+
+    print(f"🌐 Caching repo locally (first run): {repo_id} -> {local_dir}")
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(local_dir),
+        allow_patterns=allow_patterns,
+    )
+    return local_dir
+
+
+def cache_hf_repo_once(
+    repo_id: str,
+    local_dir: Path,
+    allow_patterns: list[str] | None = None,
+) -> Path:
+    return _cache_hf_repo_once(repo_id, local_dir, allow_patterns=allow_patterns)
+
+
+def get_controlnet_model(model_id: str, cache_name: str) -> ControlNetModel:
+    local_dir = CONTROLNET_LOCAL_CACHE_DIR / cache_name
+    if (local_dir / "model_index.json").is_file():
+        print(f"📦 Using local cached ControlNet: {local_dir}")
+        return ControlNetModel.from_pretrained(local_dir, torch_dtype=torch.float16)
+
+    _cache_hf_repo_once(model_id, local_dir)
+    return ControlNetModel.from_pretrained(local_dir, torch_dtype=torch.float16)
+
+
+def load_ip_adapter_local(pipe, variant: str = "general"):
+    local_dir = IP_ADAPTER_LOCAL_CACHE_DIR
+    _VARIANTS = {
+        "general": (
+            ["sdxl_models/ip-adapter_sdxl.bin", "**/*.json"],
+            "sdxl_models",
+            "ip-adapter_sdxl.bin",
+        ),
+        "face": (
+            ["sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors", "**/*.json"],
+            "sdxl_models",
+            "ip-adapter-plus-face_sdxl_vit-h.safetensors",
+        ),
+    }
+    if variant not in _VARIANTS:
+        raise ValueError(
+            f"Unknown IP-Adapter variant '{variant}'. Choose 'general' or 'face'."
+        )
+    allow_patterns, subfolder, weight_name = _VARIANTS[variant]
+    weights_path = local_dir / subfolder / weight_name
+    if not weights_path.is_file():
+        _cache_hf_repo_once(
+            "h94/IP-Adapter",
+            local_dir,
+            allow_patterns=allow_patterns,
+        )
+    print(f"📦 Using local cached IP-Adapter ({variant}): {weights_path.name}")
+    pipe.load_ip_adapter(
+        str(local_dir),
+        subfolder=subfolder,
+        weight_name=weight_name,
+    )
+
+
+def try_enable_pag(pipe, context: str = "pipeline"):
+    processors = getattr(pipe, "pag_attn_processors", None)
+    if processors:
+        print(f"✅ PAG active for {context} ({len(processors)} processor(s)).")
+        return True
+
+    if hasattr(pipe, "set_pag_applied_layers") and hasattr(
+        pipe, "_set_pag_attn_processor"
+    ):
+        try:
+            pipe.set_pag_applied_layers(["mid"])
+            pipe._set_pag_attn_processor(["mid"], do_classifier_free_guidance=True)
+            processors = getattr(pipe, "pag_attn_processors", None)
+            if processors:
+                print(f"✅ PAG enabled for {context} ({len(processors)} processor(s)).")
+                return True
+        except Exception as e:
+            print(f"⚠️ PAG setup failed for {context}: {e}")
+
+    print(f"ℹ️ PAG not active for {context}.")
+    return False
+
+
+def configure_sgm_uniform_scheduler(pipe):
+    """
+    Configure an SGM-uniform style schedule for refinement.
+    Diffusers does not expose a native 'sgm_uniform' scheduler name across all
+    pipelines, so we configure DPMSolver++ SDE with trailing timestep spacing.
+    """
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config,
+        algorithm_type="sde-dpmsolver++",
+        use_karras_sigmas=False,
+        timestep_spacing="trailing",
+    )
+
+
+def _patch_model_index_for_pag(cached_dir: Path):
+    """
+    Rewrite _class_name in model_index.json to StableDiffusionXLPAGPipeline so
+    that from_pretrained instantiates the correct class regardless of what the
+    checkpoint was originally saved as.
+    """
+    import json as _json
+
+    index_path = cached_dir / "model_index.json"
+    if not index_path.is_file():
+        return
+    with open(index_path) as f:
+        data = _json.load(f)
+    if data.get("_class_name") != "StableDiffusionXLPAGPipeline":
+        data["_class_name"] = "StableDiffusionXLPAGPipeline"
+        with open(index_path, "w") as f:
+            _json.dump(data, f, indent=2)
+        print(f"🔧 Patched model_index.json → StableDiffusionXLPAGPipeline")
+
+
+def _load_pipeline(model: str) -> StableDiffusionXLPAGPipeline:
     """
     Load an SDXL model. Uses a diffusers-format cache when available
-    (from_pretrained is ~3× faster than from_single_file). On first load
+    (from_pretrained is ~3x faster than from_single_file). On first load
     the model is converted and cached automatically.
+
+    PAG strategy:
+    - model_index.json is patched to declare StableDiffusionXLPAGPipeline so
+      from_pretrained instantiates the right class (it reads _class_name from
+      the index, not the calling class, in diffusers 0.37).
+    - pag_applied_layers=["mid"] is passed to from_pretrained so __init__
+      calls _set_pag_attn_processors at construction time.
     """
     cached_dir = MODEL_CACHE_DIR / model
-
-    # FAST PATH: diffusers cache exists
-    if (cached_dir / "model_index.json").is_file():
-        print(f"⚡ Loading from diffusers cache: {cached_dir}")
-        t0 = time.monotonic()
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            cached_dir,
-            torch_dtype=DTYPE,
-            use_safetensors=True,
-        )
-        print(f"   Loaded in {time.monotonic() - t0:.1f}s (cached, flash_attn)")
-        return pipe
+    _ensure_cache_dirs()
 
     # SLOW PATH: first-time load from single .safetensors file
-    target_model_path = Path.home() / "sd_models" / f"{model}.safetensors"
+    if not (cached_dir / "model_index.json").is_file():
+        target_model_path = Path.home() / "sd_models" / f"{model}.safetensors"
 
-    print(f"📦 Loading FP16-Fixed VAE: {VAE_ID}")
-    vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
+        print(f"📦 Loading FP16-Fixed VAE: {VAE_ID}")
+        if (VAE_LOCAL_CACHE_DIR / "config.json").is_file():
+            print(f"📦 Using local cached VAE: {VAE_LOCAL_CACHE_DIR}")
+            vae = AutoencoderKL.from_pretrained(VAE_LOCAL_CACHE_DIR, torch_dtype=DTYPE)
+        else:
+            vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
+            print(f"💾 Caching VAE locally: {VAE_LOCAL_CACHE_DIR}")
+            vae.save_pretrained(VAE_LOCAL_CACHE_DIR)
 
-    print(f"⚡ Loading SDXL Model (single-file) @ {target_model_path}")
+        print(f"⚡ Loading SDXL Model (single-file) @ {target_model_path}")
+        t0 = time.monotonic()
+        base_pipe = StableDiffusionXLPipeline.from_single_file(
+            target_model_path,
+            vae=vae,
+            torch_dtype=DTYPE,
+            use_safetensors=True,
+            variant="fp16",
+        )
+        print(f"   Loaded in {time.monotonic() - t0:.1f}s (flash_attn)")
+
+        # Save as plain diffusers format for faster future loads
+        print(f"💾 Caching as diffusers format: {cached_dir}")
+        base_pipe.save_pretrained(cached_dir)
+        del base_pipe
+        gc.collect()
+
+    # Ensure model_index.json declares the PAG class before loading.
+    _patch_model_index_for_pag(cached_dir)
+
+    print(f"⚡ Loading PAG pipeline from diffusers cache: {cached_dir}")
     t0 = time.monotonic()
-    pipe = StableDiffusionXLPipeline.from_single_file(
-        target_model_path,
-        vae=vae,
+    pipe = StableDiffusionXLPAGPipeline.from_pretrained(
+        cached_dir,
         torch_dtype=DTYPE,
         use_safetensors=True,
-        variant="fp16",
+        pag_applied_layers=["mid"],
     )
     print(f"   Loaded in {time.monotonic() - t0:.1f}s (flash_attn)")
-
-    # Save as diffusers format for faster future loads
-    print(f"💾 Caching as diffusers format: {cached_dir}")
-    pipe.save_pretrained(cached_dir)
-
     return pipe
 
 
-def get_pipe(model: str = "juggernaut"):
+def get_pipe(
+    model: str = "juggernaut",
+    load_ip_adapter: bool = False,
+    ip_adapter_variant: str = "general",
+):
     """
     Initializes the SDXL pipeline with RDNA4-specific optimizations.
+
+    When load_ip_adapter=True, loads IP-Adapter weights onto the base PAG pipe
+    after construction. PAG processors are installed at construction time
+    (pag_applied_layers=["mid"]) so the cross-attention layers are free for
+    IP-Adapter — no processor key collision occurs.
     """
     global _cached_pipe, _cached_model_name
 
@@ -233,6 +406,7 @@ def get_pipe(model: str = "juggernaut"):
         pipe.scheduler.config,
         algorithm_type="sde-dpmsolver++",
     )
+    try_enable_pag(pipe, context="base generation")
 
     # 5. MEMORY EFFICIENT ATTENTION
     # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)
@@ -240,6 +414,15 @@ def get_pipe(model: str = "juggernaut"):
 
     # 6. TRANSFER TO GPU
     pipe.to("cuda")
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+
+    # Load IP-Adapter AFTER pipe.to("cuda") so weights land on the correct device.
+    # PAG self-attention processors (mid block) are already installed at this point;
+    # IP-Adapter only touches cross-attention layers — no overlap.
+    if load_ip_adapter:
+        load_ip_adapter_local(pipe, variant=ip_adapter_variant)
+        print(f"🖼️ IP-Adapter ({ip_adapter_variant}) loaded onto base PAG pipe.")
 
     _cached_pipe = pipe
     _cached_model_name = model
@@ -267,11 +450,13 @@ def warmup_pipeline(
                 generator=generator,
                 output_type="latent",
             )
-        # Also warm up VAE decode (different kernel shapes)
+        # Also warm up VAE decode (different kernel shapes).
+        # Must use autocast: tiling is enabled, and post_quant_conv biases are
+        # fp32 even though weights are fp16 — direct decode outside autocast crashes.
         dummy_latent = torch.randn(
             1, 4, height // 8, width // 8, device="cuda", dtype=DTYPE
         )
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast("cuda"):
             pipe.vae.decode(dummy_latent)
         gc.collect()
         torch.cuda.empty_cache()
@@ -321,17 +506,24 @@ def warmup_pipeline(
 def generate_image(pipe, **kwargs):
     """
     Safely intercepts integer seeds and converts them to Diffusers-compatible Generators.
+    ip_adapter_scale: if provided, calls pipe.set_ip_adapter_scale() before generation
+    so the scale can be changed per-call without reloading weights.
     """
-    # Extract the custom seed integer, default to random if not provided
     seed = kwargs.pop("seed", -1)
+    ip_adapter_scale = kwargs.pop("ip_adapter_scale", None)
     if seed == -1:
         seed = randint(0, 2**32 - 1)
 
     print(f"🎲 Generating with seed: {seed}")
 
-    # Diffusers requires a torch.Generator object for deterministic noise
     generator = torch.Generator(device="cuda").manual_seed(seed)
     kwargs["generator"] = generator
+
+    if getattr(pipe, "pag_attn_processors", None):
+        kwargs.setdefault("pag_scale", 3.0)
+
+    if ip_adapter_scale is not None:
+        pipe.set_ip_adapter_scale(ip_adapter_scale)
 
     return pipe(**kwargs).images
 
@@ -340,5 +532,53 @@ def shutdown():
     """
     Cleanly releases all VRAM resources. Should be called on application exit.
     """
+    try:
+        from src.upscaler import cleanup_upscaler
+
+        cleanup_upscaler()
+    except Exception:
+        pass
     print("🛑 Shutting down pipeline and releasing resources...")
     cleanup_resources()
+
+
+def apply_filmic_finish(
+    img: Image.Image, grain_intensity: float = 0.020
+) -> Image.Image:
+    """
+    Applies micro-contrast recovery (unsharp mask) and monochromatic luma grain
+    to a LANCZOS-downsampled image, simulating physical sensor noise and restoring
+    the microscopic edge sharpness destroyed by mathematical averaging.
+    """
+    from PIL import ImageFilter
+
+    # Strip alpha; process RGB only so noise never contaminates the alpha channel.
+    alpha = None
+    if img.mode == "RGBA":
+        r, g, b, alpha = img.split()
+        img = Image.merge("RGB", (r, g, b))
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    # Unsharp mask: recovers micro-contrast softened by LANCZOS averaging.
+    sharpened = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=80, threshold=3))
+
+    if grain_intensity > 0:
+        img_array = np.array(sharpened, dtype=np.float32)
+        # Thread-safe RNG (no global state mutation) — intentionally non-deterministic.
+        rng = np.random.default_rng()
+        noise = rng.normal(
+            loc=0,
+            scale=255 * grain_intensity,
+            size=(img_array.shape[0], img_array.shape[1], 1),
+        )
+        # Broadcast across all 3 RGB channels equally: monochromatic luma grain.
+        img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
+        result = Image.fromarray(img_array)
+    else:
+        result = sharpened
+
+    if alpha is not None:
+        result.putalpha(alpha)
+
+    return result

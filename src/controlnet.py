@@ -14,6 +14,7 @@ from controlnet_aux import PidiNetDetector
 import traceback
 
 from src.transform import TransformParams, apply_transforms, lama_fill
+from src.pipeline import cache_hf_repo_once, HF_LOCAL_CACHE_DIR
 
 ANNOTATORS_DIR = Path.home() / "sd_annotators"
 
@@ -54,9 +55,11 @@ class ControlNetAssetGenerator:
 
         # 1. Initialize SOTA Depth Model
         try:
+            depth_local = HF_LOCAL_CACHE_DIR / "depth_anything_da3_base"
+            cache_hf_repo_once(depth_model, depth_local)
             self.depth_pipe = pipeline(
                 task="depth-estimation",
-                model=depth_model,
+                model=str(depth_local),
                 device=self.device,
                 trust_remote_code=True,
             )
@@ -66,8 +69,12 @@ class ControlNetAssetGenerator:
                 f"Bleeding-edge model failed. Falling back to stable SOTA HF weights. Error: {ve}"
             )
             fallback_model = "depth-anything/Depth-Anything-V2-Large-hf"
+            fallback_local = HF_LOCAL_CACHE_DIR / "depth_anything_v2_large_hf"
+            cache_hf_repo_once(fallback_model, fallback_local)
             self.depth_pipe = pipeline(
-                task="depth-estimation", model=fallback_model, device=self.device
+                task="depth-estimation",
+                model=str(fallback_local),
+                device=self.device,
             )
             logger.info(f"Depth model '{fallback_model}' loaded successfully.")
         except Exception as e:
@@ -76,8 +83,10 @@ class ControlNetAssetGenerator:
 
         # 2. Initialize SOTA Edge Model (PiDiNet)
         try:
+            annotators_local = HF_LOCAL_CACHE_DIR / "lllyasviel_annotators"
+            cache_hf_repo_once("lllyasviel/Annotators", annotators_local)
             self.edge_pipe = PidiNetDetector.from_pretrained(
-                "lllyasviel/Annotators",
+                str(annotators_local),
                 cache_dir=str(ANNOTATORS_DIR),
             )
             logger.info("PiDiNet Edge model loaded successfully.")

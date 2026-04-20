@@ -22,10 +22,20 @@ def add_loras(
 
     for lora in loras:
         if lora.name not in existing:
+            weight_name = f"{lora.name}.safetensors"
+            lora_path = LORAS_DIR / weight_name
+            if not lora_path.is_file():
+                print(f"⚠️  LoRA file not found, skipping: {lora_path}")
+                continue
             print(f"🔗 Adding LoRA: {lora}")
-            pipe.load_lora_weights(
-                LORAS_DIR / f"{lora.name}.safetensors", adapter_name=lora.name
-            )
+            try:
+                # Pass directory + weight_name separately; passing a bare file Path
+                # is rejected by some diffusers versions in lora_state_dict.
+                pipe.load_lora_weights(
+                    str(LORAS_DIR), weight_name=weight_name, adapter_name=lora.name
+                )
+            except Exception as exc:
+                print(f"⚠️  Failed to load LoRA '{lora.name}': {exc}")
 
     loaded = set(pipe.get_list_adapters().keys())
     active = [(l.name, l.scale) for l in loras if l.name in loaded]
