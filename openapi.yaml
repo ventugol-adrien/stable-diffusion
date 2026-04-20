@@ -72,12 +72,15 @@ paths:
   /spatial-assets/transform:
     post:
       operationId: transformImage
-      summary: Spatially transform an image with optional outpainting
+      summary: Spatially transform an image with automatic void filling
       description: >
         Applies spatial transforms (scale, rotate, displace) to an image.
-        Uses RGBA alpha tracking to precisely identify void regions. When a
-        prompt is provided and the image is RGB, void regions are filled via
-        SDXL inpainting. Without a prompt, voids are left black.
+        Uses RGBA alpha tracking to precisely identify void regions.
+
+        Void regions in RGB images are automatically filled using LaMa
+        inpainting (fast, deterministic structural continuation).
+
+        Non-RGB images (e.g. grayscale masks) are returned with black voids.
       requestBody:
         required: true
         content:
@@ -113,38 +116,14 @@ paths:
                   minimum: -360.0
                   maximum: 360.0
                   description: Rotation angle in degrees.
-                prompt:
-                  type: string
-                  nullable: true
-                  default: null
-                  description: >
-                    Text prompt for SDXL outpainting. When provided and the
-                    image is RGB, void regions are filled using SDXL inpainting.
-                    Omit to return the image with black voids.
-                model:
-                  type: string
-                  default: "juggernaut"
-                  description: Model identifier for outpainting.
-                strength:
-                  type: number
-                  format: float
-                  default: 1.0
-                  minimum: 0.0
-                  maximum: 1.0
-                  description: Inpainting denoising strength.
             examples:
-              displace_only:
-                summary: Shift image right with black voids
+              shift_right:
+                summary: Shift image right, LaMa fills void
                 value:
                   dx: 100
-                  dy: 0
-              outpaint:
-                summary: Shift and fill with outpainting
-                value:
-                  dx: 200
-                  prompt: "seamless forest background"
+                  guidance_scale: 7.5
               scale_rotate:
-                summary: Zoom out and rotate
+                summary: Zoom out and rotate, LaMa fills edges
                 value:
                   z: 0.7
                   r: 15.0

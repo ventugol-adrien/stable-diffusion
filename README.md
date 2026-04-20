@@ -9,7 +9,7 @@ A high-performance SDXL image generation API built with **FastAPI**, optimized f
 - **LoRA support** — load one or more LoRA adapters per request with independent scale control
 - **Automatic model caching** — first load converts single-file `.safetensors` to diffusers format for ~3× faster subsequent loads
 - **Pipeline warmup on startup** — MIOpen, Triton, and TunableOp caches are populated at boot, eliminating cold-start latency
-- **Spatial transforms + outpainting** — translate, scale, rotate images/masks with optional SDXL inpainting to fill void regions
+- **Spatial transforms + intelligent void filling** — translate, scale, rotate images/masks; voids are automatically filled with LaMa inpainting (fast structural continuation)
 - **Batched output** — multiple images per request, packaged as a ZIP with embedded `metrics.json`
 - **CORS-configurable** — origin allowlist via environment variable
 
@@ -39,7 +39,7 @@ A high-performance SDXL image generation API built with **FastAPI**, optimized f
     ├── loras.py             # LoRA loading and adapter management
     ├── prompt.py            # Prompt pre-processing and quality tags
     ├── controlnet.py        # ControlNet asset generation and spatial transform endpoint
-    └── transform.py         # Pure spatial transforms (scale, rotate, displace)
+    └── transform.py         # Spatial transforms and LaMa void-fill operations
 ```
 
 ## Setup
@@ -126,24 +126,23 @@ The ZIP archive contains:
 
 ### `POST /spatial-assets/transform`
 
-Spatially transform an image (scale, rotate, displace) with optional SDXL outpainting to fill void regions.
+Spatially transform an image (scale, rotate, displace) with automatic void filling.
 
 **Request body** (`multipart/form-data`):
 
-| Field         | Type      | Default      | Description                                             |
-| ------------- | --------- | ------------ | ------------------------------------------------------- |
-| `input_image` | `file`    | _(required)_ | Image file to transform                                 |
-| `dx`          | `integer` | `0`          | X-axis displacement in pixels                           |
-| `dy`          | `integer` | `0`          | Y-axis displacement in pixels                           |
-| `z`           | `float`   | `1.0`        | Zoom/scale factor (0.1–5.0)                             |
-| `r`           | `float`   | `0.0`        | Rotation angle in degrees (-360–360)                    |
-| `prompt`      | `string`  | `null`       | Text prompt for outpainting (omit to leave voids black) |
-| `model`       | `string`  | `juggernaut` | Model identifier for outpainting                        |
-| `strength`    | `float`   | `1.0`        | Inpainting denoising strength                           |
+| Field         | Type      | Default      | Description                          |
+| ------------- | --------- | ------------ | ------------------------------------ |
+| `input_image` | `file`    | _(required)_ | Image file to transform              |
+| `dx`          | `integer` | `0`          | X-axis displacement in pixels        |
+| `dy`          | `integer` | `0`          | Y-axis displacement in pixels        |
+| `z`           | `float`   | `1.0`        | Zoom/scale factor (0.1–5.0)          |
+| `r`           | `float`   | `0.0`        | Rotation angle in degrees (-360–360) |
 
 **Response** (`image/png`):
 
-The transformed image as a PNG. When `prompt` is provided and the input is an RGB image, void regions created by the transform are filled using SDXL inpainting. Without a prompt (or for grayscale masks), voids are left black.
+The transformed image as a PNG. For RGB images, void regions are automatically
+filled using LaMa inpainting (fast, deterministic structural continuation).
+Non-RGB images (e.g. grayscale masks) are returned with black voids.
 
 ### `GET /models/`
 

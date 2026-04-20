@@ -1,18 +1,22 @@
 from random import randint
 from diffusers import (
     StableDiffusionXLPipeline,
-    StableDiffusionXLImg2ImgPipeline,
-    AutoPipelineForImage2Image,
     EulerAncestralDiscreteScheduler,
     AutoencoderKL,
 )
 from pathlib import Path
-import os, gc, time
+from urllib.parse import urlparse
+import os, sys, gc, time
+import numpy as np
+import cv2
 import torch
+from PIL import Image
+from torch.hub import download_url_to_file, get_dir
 
 _cached_pipe: StableDiffusionXLPipeline | None = None
 _cached_fast_pipe: StableDiffusionXLPipeline | None = None
 _cached_model_name: str | None = None
+_cached_lama: "LaMa | None" = None
 DTYPE = torch.float16
 VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
 CWD = Path(os.getcwd())
@@ -29,11 +33,104 @@ torch.backends.cudnn.enabled = False
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+# ---------------------------------------------------------------------------
+# Vendored LaMa inpainting model (Apache-2.0, from simple-lama-inpainting)
+# Source: https://github.com/enesmsahin/simple-lama-inpainting
+# ---------------------------------------------------------------------------
+
+_LAMA_MODEL_URL = os.environ.get(
+    "LAMA_MODEL_URL",
+    "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt",
+)
+
+
+def _lama_download(url: str) -> str:
+    parts = urlparse(url)
+    hub_dir = get_dir()
+    model_dir = os.path.join(hub_dir, "checkpoints")
+    os.makedirs(model_dir, exist_ok=True)
+    cached_file = os.path.join(model_dir, os.path.basename(parts.path))
+    if not os.path.exists(cached_file):
+        sys.stderr.write(f'Downloading: "{url}" to {cached_file}\n')
+        download_url_to_file(url, cached_file, hash_prefix=None, progress=True)
+    return cached_file
+
+
+def _lama_get_image(image) -> np.ndarray:
+    if isinstance(image, Image.Image):
+        img = np.array(image)
+    elif isinstance(image, np.ndarray):
+        img = image.copy()
+    else:
+        raise TypeError("Input must be PIL Image or numpy array")
+    if img.ndim == 3:
+        img = np.transpose(img, (2, 0, 1))
+    elif img.ndim == 2:
+        img = img[np.newaxis, ...]
+    return img.astype(np.float32) / 255
+
+
+def _lama_pad_to_modulo(img: np.ndarray, mod: int) -> np.ndarray:
+    _, h, w = img.shape
+    out_h = h if h % mod == 0 else (h // mod + 1) * mod
+    out_w = w if w % mod == 0 else (w // mod + 1) * mod
+    return np.pad(img, ((0, 0), (0, out_h - h), (0, out_w - w)), mode="symmetric")
+
+
+def _lama_prepare(image, mask, device):
+    out_image = _lama_get_image(image)
+    out_mask = _lama_get_image(mask)
+    out_image = _lama_pad_to_modulo(out_image, 8)
+    out_mask = _lama_pad_to_modulo(out_mask, 8)
+    out_image = torch.from_numpy(out_image).unsqueeze(0).to(device)
+    out_mask = torch.from_numpy(out_mask).unsqueeze(0).to(device)
+    out_mask = (out_mask > 0).float()
+    return out_image, out_mask
+
+
+class LaMa:
+    def __init__(self, device: torch.device | None = None):
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_path = os.environ.get("LAMA_MODEL")
+        if model_path and not os.path.exists(model_path):
+            raise FileNotFoundError(f"LaMa model not found: {model_path}")
+        if not model_path:
+            model_path = _lama_download(_LAMA_MODEL_URL)
+        self.model = torch.jit.load(model_path, map_location=device)
+        self.model.eval()
+        self.model.to(device)
+        self.device = device
+
+    def __call__(self, image, mask) -> Image.Image:
+        image_t, mask_t = _lama_prepare(image, mask, self.device)
+        with torch.inference_mode():
+            result = self.model(image_t, mask_t)
+            out = result[0].permute(1, 2, 0).detach().cpu().numpy()
+            out = np.clip(out * 255, 0, 255).astype(np.uint8)
+            return Image.fromarray(out)
+
+
+# ---------------------------------------------------------------------------
+# Model accessors
+# ---------------------------------------------------------------------------
+
+
+def get_lama() -> LaMa:
+    global _cached_lama
+    if _cached_lama is None:
+        print("🎨 Loading LaMa inpainting model...")
+        t0 = time.monotonic()
+        _cached_lama = LaMa(device=torch.device("cpu"))
+        print(f"   LaMa ready in {time.monotonic() - t0:.1f}s")
+    return _cached_lama
+
+
 def cleanup_resources():
     """
     Forcefully releases VRAM. Critical for avoiding Linux 6.14 GTT Swap crashes.
     """
-    global _cached_pipe, _cached_fast_pipe
+    global _cached_pipe, _cached_fast_pipe, _cached_lama
 
     # Unload IP-Adapter first (holds extra GPU tensors outside the main model)
     for pipe in (_cached_pipe, _cached_fast_pipe):
@@ -51,6 +148,10 @@ def cleanup_resources():
     if _cached_fast_pipe is not None:
         del _cached_fast_pipe
         _cached_fast_pipe = None
+
+    if _cached_lama is not None:
+        del _cached_lama
+        _cached_lama = None
 
     # Force Python GC and ROCm cache clear
     gc.collect()

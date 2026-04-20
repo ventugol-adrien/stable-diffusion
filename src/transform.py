@@ -1,5 +1,11 @@
+import logging
+
 from PIL import Image
 from pydantic import BaseModel, Field
+
+from src.pipeline import get_lama
+
+logger = logging.getLogger(__name__)
 
 
 class TransformParams(BaseModel):
@@ -83,3 +89,18 @@ def apply_transforms(
         result = work.convert(original_mode)
 
     return result, void_mask
+
+
+# ---------------------------------------------------------------------------
+# Void-fill operations
+# ---------------------------------------------------------------------------
+
+
+def lama_fill(image: Image.Image, void_mask: Image.Image) -> Image.Image:
+    """Fill void regions using LaMa (fast, deterministic, no prompt)."""
+    rgb = image.convert("RGB") if image.mode != "RGB" else image
+    result = get_lama()(rgb, void_mask.convert("L"))
+    # LaMa may pad to mod-8; crop back to original size
+    if result.size != image.size:
+        result = result.crop((0, 0, image.size[0], image.size[1]))
+    return result
