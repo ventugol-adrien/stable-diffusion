@@ -22,6 +22,11 @@ MODELS_DIR = Path.home() / "sd_models"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# pip nvidia-cudnn-cu12 conflicts with the system CUDA 12.8 driver — any call into
+# the cuDNN library raises CUDNN_STATUS_NOT_INITIALIZED. Disable all cuDNN backends
+# so PyTorch uses its built-in CUDA kernels for conv and SDPA instead.
+torch.backends.cudnn.enabled = False
+torch.backends.cuda.enable_cudnn_sdp(False)
 
 
 def cleanup_resources():
