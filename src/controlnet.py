@@ -318,6 +318,39 @@ class ControlNetAssetGenerator:
 router = APIRouter(prefix="/spatial-assets", tags=["ControlNet Extraction"])
 
 
+def process_mask(mask_pil: Image.Image) -> Image.Image:
+    """
+    Takes a binary mask (any mode) and returns a soft-edge processed version:
+    1. Gaussian blur to anti-alias the hard binary edge before morphology.
+    2. Re-threshold to recover a clean binary mask from the blurred result.
+    3. Morphological close to fill small holes and smooth the contour.
+    4. Dilate-then-blur (same sigma-aware radius as _extract_masks) to produce
+       a feathered gradient that ends at the original hard-edge boundary.
+    """
+    gray = np.array(mask_pil.convert("L"))
+
+    # 1. Pre-smooth: light Gaussian blur to remove jagged binary edges
+    pre_smoothed = cv2.GaussianBlur(gray, (5, 5), sigmaX=1.5)
+
+    # 2. Re-threshold to get a clean binary mask
+    _, binary = cv2.threshold(pre_smoothed, 127, 255, cv2.THRESH_BINARY)
+
+    # 3. Morphological close to fill holes and smooth the silhouette contour
+    close_kernel = np.ones((13, 13), np.uint8)
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel)
+
+    # 4. Soft-edge feather: dilate enough to cover the blur falloff, then blur
+    blur_sigma = 7.5
+    dilate_radius = int(np.ceil(2 * blur_sigma))
+    dilate_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * dilate_radius + 1, 2 * dilate_radius + 1)
+    )
+    dilated = cv2.dilate(closed, dilate_kernel, iterations=1)
+    soft = cv2.GaussianBlur(dilated, (0, 0), sigmaX=blur_sigma)
+
+    return Image.fromarray(soft)
+
+
 @router.post("/generate", response_class=Response)
 async def generate_controlnet_assets(
     request: AssetRequest = Depends(AssetRequest.as_form),
@@ -345,3 +378,31 @@ async def generate_controlnet_assets(
             media_type="application/json",
             status_code=500,
         )
+
+
+@router.post("/process-mask", response_class=Response)
+async def process_mask_endpoint(mask: UploadFile = File(...)):
+    """
+    Takes a binary mask image and returns a soft-edge processed PNG.
+    Edges are pre-smoothed with a Gaussian blur before morphological processing
+    to remove jagged binary artefacts, then feathered with a dilate-blur pass.
+    """
+    try:
+        mask_bytes = await mask.read()
+        mask_pil = Image.open(io.BytesIO(mask_bytes))
+    except UnidentifiedImageError:
+        return Response(
+            content='{"success": false, "message": "File is not a valid image."}',
+            media_type="application/json",
+            status_code=400,
+        )
+
+    result = process_mask(mask_pil)
+
+    buf = io.BytesIO()
+    result.save(buf, format="PNG")
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/png",
+        headers={"Content-Disposition": "inline; filename=processed_mask.png"},
+    )
