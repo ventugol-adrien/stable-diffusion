@@ -217,28 +217,50 @@ def get_controlnet_model(model_id: str, cache_name: str) -> ControlNetModel:
 
 def load_ip_adapter_local(pipe, variant: str = "general"):
     local_dir = IP_ADAPTER_LOCAL_CACHE_DIR
+    # allow_patterns, subfolder, weight_name, image_encoder_folder
+    # SDXL general: ViT-bigG-14 encoder lives under sdxl_models/image_encoder/
+    # SDXL face (ViT-H):   encoder lives under models/image_encoder/
     _VARIANTS = {
         "general": (
-            ["sdxl_models/ip-adapter_sdxl.bin", "**/*.json"],
+            [
+                "sdxl_models/ip-adapter_sdxl.bin",
+                "sdxl_models/image_encoder/**",
+                "**/*.json",
+            ],
             "sdxl_models",
             "ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder",
         ),
         "face": (
-            ["sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors", "**/*.json"],
+            [
+                "sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
+                "models/image_encoder/**",
+                "**/*.json",
+            ],
             "sdxl_models",
             "ip-adapter-plus-face_sdxl_vit-h.safetensors",
+            "models/image_encoder",
         ),
     }
     if variant not in _VARIANTS:
         raise ValueError(
             f"Unknown IP-Adapter variant '{variant}'. Choose 'general' or 'face'."
         )
-    allow_patterns, subfolder, weight_name = _VARIANTS[variant]
+    allow_patterns, subfolder, weight_name, image_encoder_folder = _VARIANTS[variant]
     weights_path = local_dir / subfolder / weight_name
-    if not weights_path.is_file():
-        _cache_hf_repo_once(
+    encoder_dir = local_dir / image_encoder_folder
+    encoder_ok = (encoder_dir / "model.safetensors").is_file() or (
+        encoder_dir / "pytorch_model.bin"
+    ).is_file()
+    if not weights_path.is_file() or not encoder_ok:
+        # Bypass _cache_hf_repo_once: it short-circuits on any existing content,
+        # which would skip the image encoder if only JSON configs were fetched earlier.
+        print(
+            f"🌐 Downloading IP-Adapter ({variant}) weights + image encoder from h94/IP-Adapter..."
+        )
+        snapshot_download(
             "h94/IP-Adapter",
-            local_dir,
+            local_dir=str(local_dir),
             allow_patterns=allow_patterns,
         )
     print(f"📦 Using local cached IP-Adapter ({variant}): {weights_path.name}")
@@ -246,6 +268,7 @@ def load_ip_adapter_local(pipe, variant: str = "general"):
         str(local_dir),
         subfolder=subfolder,
         weight_name=weight_name,
+        image_encoder_folder=image_encoder_folder,
     )
 
 

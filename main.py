@@ -32,6 +32,7 @@ from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
 
 from src.controlnet import router as depthmap_router, get_asset_generator
+from src.experiment import router as experiment_router
 from src.hr_fix import tiled_refine_image
 from src.transform import TransformParams, apply_transforms, lama_fill
 from src.upscaler import upscale_image
@@ -89,6 +90,7 @@ app.add_middleware(
 
 app.include_router(depthmap_router)
 app.include_router(loras_router)
+app.include_router(experiment_router)
 
 
 @app.post("/generate/image")

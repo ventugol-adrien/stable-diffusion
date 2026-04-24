@@ -1,6 +1,8 @@
 import os
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -37,6 +39,7 @@ UPSCALE_MODEL_URL = (
 UPSCALE_MODEL_PATH = UPSCALE_CACHE_DIR / "RealESRGAN_x4plus.pth"
 
 _cached_upscaler: RealESRGANer | None = None
+_thread_local = threading.local()
 
 
 def _ensure_upscale_model() -> Path:
@@ -50,11 +53,8 @@ def _ensure_upscale_model() -> Path:
     return UPSCALE_MODEL_PATH
 
 
-def get_upscaler() -> RealESRGANer:
-    global _cached_upscaler
-    if _cached_upscaler is not None:
-        return _cached_upscaler
-
+def _make_upscaler() -> RealESRGANer:
+    """Create a fresh RealESRGANer instance (one per thread)."""
     model_path = _ensure_upscale_model()
     model = RRDBNet(
         num_in_ch=3,
@@ -64,17 +64,23 @@ def get_upscaler() -> RealESRGANer:
         num_grow_ch=32,
         scale=4,
     )
-    _cached_upscaler = RealESRGANer(
+    return RealESRGANer(
         scale=4,
         model_path=str(model_path),
         model=model,
         tile=512,
         tile_pad=10,
         pre_pad=0,
-        half=torch.cuda.is_available(),
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        half=False,
+        device=torch.device("cpu"),
     )
-    return _cached_upscaler
+
+
+def get_upscaler() -> RealESRGANer:
+    """Return a thread-local RealESRGANer instance (safe for parallel use)."""
+    if not hasattr(_thread_local, "upscaler"):
+        _thread_local.upscaler = _make_upscaler()
+    return _thread_local.upscaler
 
 
 def upscale_image(image: Image.Image, outscale: int = 2) -> Image.Image:
@@ -88,8 +94,25 @@ def upscale_image(image: Image.Image, outscale: int = 2) -> Image.Image:
         return image
 
 
+def upscale_images_parallel(
+    images: list[Image.Image],
+    outscale: int = 4,
+    max_workers: int = 8,
+) -> list[Image.Image]:
+    """Upscale N images in parallel using one thread-local RealESRGANer per thread."""
+    results: list[Image.Image] = [None] * len(images)  # type: ignore[list-item]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(images))) as pool:
+        futures = {
+            pool.submit(upscale_image, img, outscale): idx
+            for idx, img in enumerate(images)
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
 def cleanup_upscaler():
     global _cached_upscaler
-    if _cached_upscaler is not None:
-        del _cached_upscaler
-        _cached_upscaler = None
+    _cached_upscaler = None
+    if hasattr(_thread_local, "upscaler"):
+        del _thread_local.upscaler

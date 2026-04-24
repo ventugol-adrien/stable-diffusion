@@ -242,6 +242,324 @@ paths:
                   type: string
               example: ["juggernaut", "pony"]
 
+  /experiment:
+    post:
+      operationId: startExperiment
+      summary: Start a hyperparameter sweep experiment
+      description: >
+        Submits a sweep experiment and returns immediately with an `id`.
+        Poll `/experiment/{id}` for progress; download from
+        `/experiment/{id}/download` when complete.
+
+
+        **Sweep axes** are specified as `<param>_min`, `<param>_max`,
+        `<param>_step` form fields. Provide only `<param>_min` to fix a
+        parameter at a single value without sweeping it.
+
+
+        **Control-image axes** (batched in parallel on GPU — inner loop):
+        `transform_dx`, `transform_dy`, `transform_z`, `transform_r`,
+        `transform_strength`
+
+
+        **Scalar axes** (must be uniform within a batch — outer loop):
+        `depthmap_scale`, `edge_map_scale`, `ip_scale`, `strength`,
+        `final_strength`
+
+
+        The transform cache is keyed by `(dx, dy, z, r)` — each unique
+        combination runs `apply_transforms → LaMa fill → depth → canny`
+        once. `transform_strength` is a cheap PIL composite and does not
+        bust the cache.
+
+
+        Results are written to `/scratch/<id>/` while running. The ZIP
+        contains `gallery.html`, `combos.json`, and `images/*.png`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ExperimentRequest"
+            examples:
+              dx_dy_sweep:
+                summary: Sweep transform dx (2 values) × dy (2 values) = 4 images
+                value:
+                  user_input: "cinematic interior, cozy living room at golden hour"
+                  model: "juggernaut"
+                  seed: 42
+                  transform_dx_min: -60
+                  transform_dx_max: 60
+                  transform_dx_step: 120
+                  transform_dy_min: -40
+                  transform_dy_max: 40
+                  transform_dy_step: 80
+              z_r_sweep:
+                summary: Sweep transform z (2 values) × r (2 values) = 4 images
+                value:
+                  user_input: "architectural exterior, modernist house at dusk"
+                  model: "juggernaut"
+                  seed: 1337
+                  transform_z_min: 0.85
+                  transform_z_max: 1.15
+                  transform_z_step: 0.30
+                  transform_r_min: -15.0
+                  transform_r_max: 15.0
+                  transform_r_step: 30.0
+              scalar_sweep:
+                summary: Sweep depthmap_scale × edge_map_scale = 4 images
+                value:
+                  user_input: "photorealistic portrait, soft studio lighting"
+                  model: "juggernaut"
+                  seed: 7
+                  depthmap_scale_min: 0.3
+                  depthmap_scale_max: 0.6
+                  depthmap_scale_step: 0.3
+                  edge_map_scale_min: 0.2
+                  edge_map_scale_max: 0.4
+                  edge_map_scale_step: 0.2
+              all_axes:
+                summary: All 10 axes, 2 values each = 1024 images
+                value:
+                  user_input: "cinematic interior, cozy living room at golden hour"
+                  model: "juggernaut"
+                  seed: 42
+                  transform_dx_min: -60
+                  transform_dx_max: 60
+                  transform_dx_step: 120
+                  transform_dy_min: -40
+                  transform_dy_max: 40
+                  transform_dy_step: 80
+                  transform_z_min: 0.85
+                  transform_z_max: 1.15
+                  transform_z_step: 0.30
+                  transform_r_min: -15.0
+                  transform_r_max: 15.0
+                  transform_r_step: 30.0
+                  transform_strength_min: 0.5
+                  transform_strength_max: 0.8
+                  transform_strength_step: 0.3
+                  depthmap_scale_min: 0.3
+                  depthmap_scale_max: 0.6
+                  depthmap_scale_step: 0.3
+                  edge_map_scale_min: 0.2
+                  edge_map_scale_max: 0.4
+                  edge_map_scale_step: 0.2
+                  ip_scale_min: 0.3
+                  ip_scale_max: 0.6
+                  ip_scale_step: 0.3
+                  strength_min: 0.6
+                  strength_max: 0.8
+                  strength_step: 0.2
+                  final_strength_min: 0.20
+                  final_strength_max: 0.25
+                  final_strength_step: 0.05
+      x-codeSamples:
+        - lang: Shell
+          label: "dx+dy sweep (no image files)"
+          source: |
+            curl -X POST http://localhost:8000/experiment \
+              -F "user_input=cinematic interior, cozy living room at golden hour" \
+              -F "model=juggernaut" \
+              -F "seed=42" \
+              -F "transform_dx_min=-60" \
+              -F "transform_dx_max=60" \
+              -F "transform_dx_step=120" \
+              -F "transform_dy_min=-40" \
+              -F "transform_dy_max=40" \
+              -F "transform_dy_step=80"
+        - lang: Shell
+          label: "full 10-axis sweep with image files"
+          source: |
+            curl -X POST http://localhost:8000/experiment \
+              -F "user_input=cinematic interior, cozy living room at golden hour" \
+              -F "model=juggernaut" \
+              -F "seed=42" \
+              -F "transform_input_image=@/path/to/input.png" \
+              -F "mask=@/path/to/mask.png" \
+              -F "reference=@/path/to/reference.png" \
+              -F "ip_adapter_image=@/path/to/style_ref.png" \
+              -F "transform_dx_min=-60" \
+              -F "transform_dx_max=60" \
+              -F "transform_dx_step=120" \
+              -F "transform_dy_min=-40" \
+              -F "transform_dy_max=40" \
+              -F "transform_dy_step=80" \
+              -F "transform_z_min=0.85" \
+              -F "transform_z_max=1.15" \
+              -F "transform_z_step=0.30" \
+              -F "transform_r_min=-15.0" \
+              -F "transform_r_max=15.0" \
+              -F "transform_r_step=30.0" \
+              -F "transform_strength_min=0.5" \
+              -F "transform_strength_max=0.8" \
+              -F "transform_strength_step=0.3" \
+              -F "depthmap_scale_min=0.3" \
+              -F "depthmap_scale_max=0.6" \
+              -F "depthmap_scale_step=0.3" \
+              -F "edge_map_scale_min=0.2" \
+              -F "edge_map_scale_max=0.4" \
+              -F "edge_map_scale_step=0.2" \
+              -F "ip_scale_min=0.3" \
+              -F "ip_scale_max=0.6" \
+              -F "ip_scale_step=0.3" \
+              -F "strength_min=0.6" \
+              -F "strength_max=0.8" \
+              -F "strength_step=0.2" \
+              -F "final_strength_min=0.20" \
+              -F "final_strength_max=0.25" \
+              -F "final_strength_step=0.05"
+      responses:
+        "200":
+          description: Experiment queued — returns immediately
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+              example:
+                id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        "400":
+          description: Missing required field (e.g. user_input)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+
+  /experiment/{exp_id}:
+    get:
+      operationId: getExperimentStatus
+      summary: Poll experiment progress
+      description: >
+        Returns current status, progress counters, elapsed time, and
+        estimated time to completion (ETD). Cheap in-memory read — safe to
+        poll every few seconds.
+      parameters:
+        - name: exp_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+      x-codeSamples:
+        - lang: Shell
+          label: "poll status"
+          source: |
+            curl http://localhost:8000/experiment/3fa85f64-5717-4562-b3fc-2c963f66afa6
+        - lang: Shell
+          label: "bash loop — poll until done"
+          source: |
+            ID="3fa85f64-5717-4562-b3fc-2c963f66afa6"
+            while true; do
+              STATUS=$(curl -s http://localhost:8000/experiment/$ID \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])")
+              echo "Status: $STATUS"
+              [ "$STATUS" = "complete" ] || [ "$STATUS" = "error" ] && break
+              sleep 5
+            done
+      responses:
+        "200":
+          description: Experiment status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExperimentStatus"
+              example:
+                id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                status: "running"
+                total: 32
+                completed: 10
+                elapsed_seconds: 84.5
+                etd_seconds: 254.0
+                error: null
+        "404":
+          description: Experiment not found
+
+  /experiment/{exp_id}/download:
+    get:
+      operationId: downloadExperiment
+      summary: Download completed experiment ZIP
+      description: >
+        When `status` is `complete`, returns a ZIP containing:
+
+        - `gallery.html` — self-contained HTML gallery (CSS grid, lazy images,
+          per-card param table, all CSS inlined — open directly in browser)
+
+        - `combos.json` — full manifest of all combos with filenames and params
+
+        - `images/0000.png` … `images/NNNN.png` — generated PNGs
+
+
+        Returns `202 Accepted` with a progress JSON body while still running.
+      parameters:
+        - name: exp_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+      x-codeSamples:
+        - lang: Shell
+          label: "download when complete"
+          source: |
+            curl -O -J http://localhost:8000/experiment/3fa85f64-5717-4562-b3fc-2c963f66afa6/download
+        - lang: Shell
+          label: "bash — poll then download"
+          source: |
+            ID="3fa85f64-5717-4562-b3fc-2c963f66afa6"
+            while true; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                http://localhost:8000/experiment/$ID/download)
+              if [ "$CODE" = "200" ]; then
+                curl -O -J http://localhost:8000/experiment/$ID/download
+                echo "Downloaded."
+                break
+              fi
+              PROG=$(curl -s http://localhost:8000/experiment/$ID \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['completed']}/{d['total']}\")")
+              echo "Still running: $PROG images"
+              sleep 10
+            done
+      responses:
+        "200":
+          description: Completed experiment ZIP archive
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: "attachment; filename=experiment_3fa85f64.zip"
+        "202":
+          description: Experiment still in progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExperimentStatus"
+        "404":
+          description: Experiment not found
+        "500":
+          description: Experiment failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+                    description: Python traceback from the failed worker thread
+
 components:
   schemas:
     LoRA:
@@ -311,9 +629,8 @@ components:
           format: binary
           description: Per-slot IP-Adapter reference image.
         ip_scale:
-          type: number
+          type: ["number", "null"]
           format: float
-          nullable: true
           description: Per-slot IP-Adapter influence scale.
         transform.input_image:
           type: string
@@ -341,9 +658,8 @@ components:
           default: 0.0
           description: Rotation angle in degrees.
         transform_strength:
-          type: number
+          type: ["number", "null"]
           format: float
-          nullable: true
           minimum: 0.0
           maximum: 1.0
           description: >
@@ -397,23 +713,20 @@ components:
           default: -1
           description: Seed for prompt processing RNG. Use `-1` for random.
         reference:
-          type: string
+          type: ["string", "null"]
           format: binary
-          nullable: true
           description: >
             Global reference image for img2img. LANCZOS-fit to 1024×1024.
             Requires `strength` to take effect.
         strength:
-          type: number
+          type: ["number", "null"]
           format: float
-          nullable: true
           minimum: 0.0
           maximum: 1.0
           description: Denoising strength for the global img2img reference pass.
         depth_map:
-          type: string
+          type: ["string", "null"]
           format: binary
-          nullable: true
           description: >
             Global depth map for Xinsir SDXL depth ControlNet. Applied to all
             batch slots uniformly.
@@ -427,9 +740,8 @@ components:
             Conditioning scale(s) for the global depth ControlNet.
             Repeat the field for multiple values.
         canny_edges:
-          type: string
+          type: ["string", "null"]
           format: binary
-          nullable: true
           description: >
             Global canny edge map for Xinsir SDXL canny ControlNet. Applied to
             all batch slots uniformly.
@@ -442,21 +754,18 @@ components:
           description: >
             Conditioning scale(s) for the global canny ControlNet.
         ip_image:
-          type: string
+          type: ["string", "null"]
           format: binary
-          nullable: true
           description: Global IP-Adapter reference image for style transfer.
         ip_scale:
-          type: number
+          type: ["number", "null"]
           format: float
-          nullable: true
           minimum: 0.0
           maximum: 1.0
           description: Global IP-Adapter influence scale.
         final_strength:
-          type: number
+          type: ["number", "null"]
           format: float
-          nullable: true
           minimum: 0.0
           maximum: 1.0
           description: >
@@ -549,319 +858,198 @@ components:
           items:
             $ref: "#/components/schemas/ValidationError"
 
-paths:
-  /generate/image/:
-    post:
-      operationId: generateImage
-      summary: Generate images from a text prompt
-      description: >
-        Generates one or more SDXL images based on the provided prompt and
-        parameters. Returns a ZIP archive containing the generated PNG images
-        and a `metrics.json` file with timing information.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ImageRequest"
-            examples:
-              basic:
-                summary: Simple text-to-image
-                value:
-                  user_input: "a cat sitting on a windowsill at sunset"
-              lightning:
-                summary: Fast generation with lightning mode
-                value:
-                  user_input: "cyberpunk cityscape at night"
-                  lightning: true
-                  batch_size: 2
-              with_loras:
-                summary: Generation with LoRA adapters
-                value:
-                  user_input: "portrait of a woman in a garden"
-                  model: "juggernaut"
-                  loras:
-                    - name: "detail_enhancer"
-                      scale: 0.7
-      responses:
-        "200":
-          description: ZIP archive containing generated images and metrics
-          content:
-            application/zip:
-              schema:
-                type: string
-                format: binary
-                description: >
-                  ZIP file containing:
-                  - `metrics.json` with latency, throughput, and timing breakdown
-                  - `image_0.png`, `image_1.png`, ... for each generated image
-          headers:
-            Content-Disposition:
-              schema:
-                type: string
-                example: "attachment; filename=results.zip"
-        "422":
-          description: Validation error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HTTPValidationError"
-
-  /spatial-assets/transform:
-    post:
-      operationId: transformImage
-      summary: Spatially transform an image with automatic void filling
-      description: >
-        Applies spatial transforms (scale, rotate, displace) to an image.
-        Uses RGBA alpha tracking to precisely identify void regions.
-
-        Void regions in RGB images are automatically filled using LaMa
-        inpainting (fast, deterministic structural continuation).
-
-        Non-RGB images (e.g. grayscale masks) are returned with black voids.
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required:
-                - input_image
-              properties:
-                input_image:
-                  type: string
-                  format: binary
-                  description: The image file to transform.
-                dx:
-                  type: integer
-                  default: 0
-                  description: X-axis displacement in pixels.
-                dy:
-                  type: integer
-                  default: 0
-                  description: Y-axis displacement in pixels.
-                z:
-                  type: number
-                  format: float
-                  default: 1.0
-                  minimum: 0.1
-                  maximum: 5.0
-                  description: Zoom/scale factor (1.0 = no change).
-                r:
-                  type: number
-                  format: float
-                  default: 0.0
-                  minimum: -360.0
-                  maximum: 360.0
-                  description: Rotation angle in degrees.
-            examples:
-              shift_right:
-                summary: Shift image right, LaMa fills void
-                value:
-                  dx: 100
-                  guidance_scale: 7.5
-              scale_rotate:
-                summary: Zoom out and rotate, LaMa fills edges
-                value:
-                  z: 0.7
-                  r: 15.0
-      responses:
-        "200":
-          description: Transformed PNG image
-          content:
-            image/png:
-              schema:
-                type: string
-                format: binary
-          headers:
-            Content-Disposition:
-              schema:
-                type: string
-                example: "inline; filename=transformed.png"
-        "400":
-          description: Invalid image file
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  message:
-                    type: string
-                    example: "File is not a valid image."
-        "422":
-          description: Validation error (e.g. z out of range)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HTTPValidationError"
-
-  /models/:
-    get:
-      operationId: listModels
-      summary: List available models
-      description: >
-        Returns an array of model identifiers available for generation.
-        Each identifier corresponds to a `.safetensors` file in the models
-        directory.
-      responses:
-        "200":
-          description: Array of model identifier strings
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: string
-              example: ["juggernaut", "pony"]
-
-components:
-  schemas:
-    LoRA:
-      type: object
-      required:
-        - name
-      properties:
-        name:
-          type: string
-          description: >
-            LoRA adapter filename (without `.safetensors` extension) located
-            in the `~/sd_loras/` directory.
-          example: "detail_enhancer"
-        scale:
-          type: number
-          format: float
-          default: 0.5
-          minimum: 0
-          maximum: 2
-          description: Adapter influence scale.
-          example: 0.7
-
-    ImageRequest:
+    ExperimentRequest:
       type: object
       required:
         - user_input
+      description: >
+        Submitted as `multipart/form-data`. Each sweep axis uses three fields:
+        `<param>_min`, `<param>_max`, `<param>_step`. Providing only
+        `<param>_min` fixes the parameter without sweeping it.
+
+
+        **Control-image axes** (parallel GPU batch — inner loop):
+        `transform_dx`, `transform_dy`, `transform_z`, `transform_r`,
+        `transform_strength`
+
+
+        **Scalar axes** (outer loop — uniform per batch):
+        `depthmap_scale`, `edge_map_scale`, `ip_scale`, `strength`,
+        `final_strength`
       properties:
         user_input:
           type: string
-          description: Text prompt describing the desired image.
-          example: "a cat sitting on a windowsill at sunset"
+          example: "cinematic interior, cozy living room at golden hour"
         model:
           type: string
           default: "juggernaut"
-          description: >
-            Model identifier. Must match a `.safetensors` filename in the
-            models directory or a cached diffusers model.
           example: "juggernaut"
-        loras:
-          type: array
-          items:
-            $ref: "#/components/schemas/LoRA"
-          default: []
-          description: List of LoRA adapters to apply during generation.
-        lightning:
-          type: boolean
-          default: false
-          description: >
-            Enable lightning mode for faster inference (8 steps, CFG 1.5)
-            instead of standard mode (25 steps, CFG 7.0).
-        batch_size:
+        seed:
           type: integer
-          default: 1
-          minimum: 1
-          description: Number of images to generate per request.
-          example: 1
+          default: -1
+          description: Seed for generation RNG. -1 = fresh random per image.
+          example: 42
+        loras:
+          type: string
+          description: JSON-encoded array of LoRA adapter objects.
+          example: '[{"name":"detail_enhancer","scale":0.7}]'
+        transform_input_image:
+          type: string
+          format: binary
+          description: >
+            Source image for the spatial transform pipeline. Required for any
+            transform axis to take effect. LaMa fills voids; depth and canny
+            priors are auto-generated from the filled result.
+        mask:
+          type: string
+          format: binary
+          description: Grayscale inpainting mask (white=inpaint, black=preserve).
         reference:
           type: string
-          format: byte
-          nullable: true
-          default: null
-          description: >
-            Base64-encoded reference image bytes for image-to-image generation.
-        reference_strength:
-          type: number
-          format: float
-          nullable: true
-          default: null
-          description: Denoising strength for image-to-image (0.0–1.0).
-        image_seed:
-          type: integer
-          default: -1
-          description: >
-            Seed for the image generation RNG. Use `-1` for a random seed.
-          example: -1
-        prompt_seed:
-          type: integer
-          default: -1
-          description: >
-            Seed for prompt processing RNG. Use `-1` for a random seed.
-          example: -1
-
-    GenerationMetrics:
-      type: object
-      description: Performance metrics included in the response ZIP as `metrics.json`.
-      properties:
-        latency:
-          type: number
-          format: float
-          description: Total wall-clock time in seconds.
-          example: 4.82
-        throughput:
-          type: number
-          format: float
-          description: Images per second.
-          example: 0.207
-        breakdown:
-          type: object
-          properties:
-            pipeline_load_time:
-              type: number
-              format: float
-              description: Time to load or retrieve the cached pipeline.
-              example: 0.001
-            lora_load_time:
-              type: number
-              format: float
-              description: Time to load LoRA adapters.
-              example: 0.0
-            prompt_processing_time:
-              type: number
-              format: float
-              description: Time for prompt conditioning via Compel.
-              example: 0.12
-            generation_time:
-              type: number
-              format: float
-              description: Time for diffusion inference and VAE decode.
-              example: 4.70
-
-    ValidationError:
-      type: object
-      required:
-        - loc
-        - msg
-        - type
-      properties:
-        loc:
-          type: array
-          items:
-            anyOf:
-              - type: string
-              - type: integer
-          description: Location of the error in the request.
-        msg:
+          format: binary
+          description: Base reference image. Blended with the transform fill inside the mask.
+        ip_adapter_image:
           type: string
-          description: Human-readable error message.
-        type:
-          type: string
-          description: Error type identifier.
+          format: binary
+          description: IP-Adapter style reference image.
+        transform_dx_min:
+          type: number
+          example: -60
+        transform_dx_max:
+          type: number
+          example: 60
+        transform_dx_step:
+          type: number
+          example: 120
+        transform_dy_min:
+          type: number
+          example: -40
+        transform_dy_max:
+          type: number
+          example: 40
+        transform_dy_step:
+          type: number
+          example: 80
+        transform_z_min:
+          type: number
+          example: 0.85
+        transform_z_max:
+          type: number
+          example: 1.15
+        transform_z_step:
+          type: number
+          example: 0.30
+        transform_r_min:
+          type: number
+          example: -15.0
+        transform_r_max:
+          type: number
+          example: 15.0
+        transform_r_step:
+          type: number
+          example: 30.0
+        transform_strength_min:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          example: 0.5
+        transform_strength_max:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          example: 0.8
+        transform_strength_step:
+          type: number
+          example: 0.3
+        depthmap_scale_min:
+          type: number
+          example: 0.3
+        depthmap_scale_max:
+          type: number
+          example: 0.6
+        depthmap_scale_step:
+          type: number
+          example: 0.3
+        edge_map_scale_min:
+          type: number
+          example: 0.2
+        edge_map_scale_max:
+          type: number
+          example: 0.4
+        edge_map_scale_step:
+          type: number
+          example: 0.2
+        ip_scale_min:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          example: 0.3
+        ip_scale_max:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          example: 0.6
+        ip_scale_step:
+          type: number
+          example: 0.3
+        strength_min:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          example: 0.6
+        strength_max:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          example: 0.8
+        strength_step:
+          type: number
+          example: 0.2
+        final_strength_min:
+          type: number
+          minimum: 0.0
+          maximum: 0.4
+          description: Clamped to [0.01, 0.40] internally.
+          example: 0.20
+        final_strength_max:
+          type: number
+          minimum: 0.0
+          maximum: 0.4
+          example: 0.25
+        final_strength_step:
+          type: number
+          example: 0.05
 
-    HTTPValidationError:
+    ExperimentStatus:
       type: object
       properties:
-        detail:
-          type: array
-          items:
-            $ref: "#/components/schemas/ValidationError"
+        id:
+          type: string
+          format: uuid
+          example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        status:
+          type: string
+          enum: [pending, running, complete, error]
+          example: "running"
+        total:
+          type: integer
+          description: Total number of images to generate (Cartesian product of all axes).
+          example: 32
+        completed:
+          type: integer
+          description: Number of images saved to disk so far.
+          example: 10
+        elapsed_seconds:
+          type: number
+          format: float
+          example: 84.5
+        etd_seconds:
+          type: ["number", "null"]
+          format: float
+          description: Estimated seconds until completion. Null if 0 images completed yet.
+          example: 254.0
+        error:
+          type: ["string", "null"]
+          description: Python traceback if status is "error", otherwise null.
+          example: null
+
