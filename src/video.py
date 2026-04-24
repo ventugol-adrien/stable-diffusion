@@ -524,7 +524,7 @@ async def generate_video(
     lightning: bool = Form(default=True),
     width: int = Form(default=832),
     height: int = Form(default=480),
-    num_frames: int = Form(default=81),
+    num_frames: int = Form(default=49),
     frame_rate: float = Form(default=16.0),
     num_inference_steps: int = Form(default=40),
     guidance_scale: float = Form(default=4.0),
@@ -640,6 +640,8 @@ async def generate_video(
                 pipe.disable_lora()
 
         logger.info(f"[WAN] {mode}: generating {width}x{height} @ {n_steps} steps...")
+        gc.collect()
+        torch.cuda.empty_cache()
         t0 = time.monotonic()
         with torch.inference_mode():
             output = pipe(
@@ -718,6 +720,8 @@ async def generate_video(
                 pipe.disable_lora()
 
         logger.info(f"[WAN] {mode}: generating {width}x{height} @ {n_steps} steps...")
+        gc.collect()
+        torch.cuda.empty_cache()
         t0 = time.monotonic()
         with torch.inference_mode():
             output = pipe(
