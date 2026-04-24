@@ -347,6 +347,7 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
         "num_images_per_prompt": num_images,
         "ip_adapter_image": ip_adapter_image if request.ip_adapter_image else None,
         "control_guidance_end_step": 0.5,
+        "seed": request.image_seed,
     }
 
     if has_mask_in_divergent:
