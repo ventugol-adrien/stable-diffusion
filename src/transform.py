@@ -8,13 +8,6 @@ from src.pipeline import get_lama
 logger = logging.getLogger(__name__)
 
 
-class TransformParams(BaseModel):
-    dx: int = 0
-    dy: int = 0
-    z: float = Field(1.0, ge=0.1, le=5.0)
-    r: float = Field(0.0, ge=-360.0, le=360.0)
-
-
 def apply_transforms(
     img: Image.Image, params: TransformParams
 ) -> tuple[Image.Image, Image.Image]:

@@ -5,6 +5,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Request, UploadFile
 
 
+class TransformParams(BaseModel):
+    dx: int = 0
+    dy: int = 0
+    z: float = Field(1.0, ge=0.1, le=5.0)
+    r: float = Field(0.0, ge=-360.0, le=360.0)
+
+
+class AssetRequest(BaseModel):
+    model_config = {"arbitrary_types_allowed": True}
+    input_image: UploadFile
+
+    @classmethod
+    def as_form(cls, input_image: UploadFile = File(...)) -> "AssetRequest":
+        return cls(input_image=input_image)
+
+
 class LoRA(BaseModel):
     name: str
     scale: float = 0.5

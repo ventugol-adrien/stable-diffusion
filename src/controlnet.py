@@ -21,15 +21,6 @@ ANNOTATORS_DIR = Path.home() / "sd_annotators"
 _cached_asset_generator: "ControlNetAssetGenerator | None" = None
 
 
-class AssetRequest(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
-    input_image: UploadFile
-
-    @classmethod
-    def as_form(cls, input_image: UploadFile = File(...)) -> "AssetRequest":
-        return cls(input_image=input_image)
-
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",

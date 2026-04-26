@@ -66,7 +66,7 @@ from src.pipeline import (
 )
 from src.prompt import process_prompt
 from src.transform import TransformParams, apply_transforms, lama_fill
-from src.upscaler import upscale_image, upscale_images_parallel
+from src.upscaler_gpu import upscale_images_gpu
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -705,7 +705,7 @@ def _run_experiment(
                     gc.collect()
                     torch.cuda.empty_cache()
                     _vram("before upscale (post empty_cache)")
-                    upscaled = upscale_images_parallel(images, outscale=4)
+                    upscaled = upscale_images_gpu(images, outscale=4)
                     _vram("after upscale")
                     # Detect full upscale failure (all returned original size — OOM).
                     all_failed = all(
