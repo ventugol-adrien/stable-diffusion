@@ -38,7 +38,7 @@ def execute_dag(dag: dict[str, BaseModel], context: dict):
         current_node = dag[node_id]
 
         # Execute node with current context
-        result = current_node(**current_node.params, **context)
+        result = current_node(**current_node.params.model_dump(), **context)
         results[node_id] = result
 
         # Propagate results to dependent nodes
