@@ -1,16 +1,24 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class BaseNodeModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     dependencies: list[str] | None = None
     next_nodes: list[str] | None = None
 
 
 class BaseNode:
-    def __init__(self, node: BaseNodeModel, **kwargs):
+    def __init__(self, **kwargs):
+        base_node_data = BaseNodeModel(**kwargs)
         self.params = kwargs
-        self.dependencies = node.dependencies if node.dependencies is not None else []
-        self.next_nodes = node.next_nodes if node.next_nodes is not None else []
+        self.dependencies = (
+            base_node_data.dependencies
+            if base_node_data.dependencies is not None
+            else []
+        )
+        self.next_nodes = (
+            base_node_data.next_nodes if base_node_data.next_nodes is not None else []
+        )
 
     def __call__(self, *args, **kwds):
         print(f"Executing node: {self} with params: {self.params}")
