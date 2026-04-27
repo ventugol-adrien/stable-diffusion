@@ -7,7 +7,10 @@ import zipfile
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from src.models import ImageRequest
+from src.executor import execute_dag
+from src.nodes.base_node import BaseNode
+from src.nodes.compel_node import CompelNode
+from src.models import DAG, ImageRequest
 from compel import CompelForSDXL
 from diffusers import (
     AutoPipelineForImage2Image,
@@ -406,3 +409,15 @@ def get_models():
     model_safetensors = [f.stem for f in MODELS_DIR.glob("*.safetensors")]
 
     return JSONResponse(content=model_safetensors, media_type="application/json")
+
+
+@app.post("/workflows/")
+def execute_workflows(request: DAG = Depends(DAG.as_form)):
+
+    response = execute_dag(request.nodes, context={})
+
+    return Response(
+        content=response,
+        media_type="image/png",
+        headers={"Content-Disposition": "inline; filename=image.png"},
+    )
