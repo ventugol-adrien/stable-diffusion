@@ -16,11 +16,11 @@ class TransformParams(BaseModel):
     r: float = Field(0.0, ge=-360.0, le=360.0)
 
 
-class DAG(BaseModel):
-    nodes: dict[str, BaseNode] = Field(..., description="List of nodes in the DAG")
+class DAGForm(BaseModel):
+    nodes: dict[str, BaseModel] = Field(..., description="List of nodes in the DAG")
 
     @classmethod
-    async def as_form(cls, request: Request) -> "DAG":
+    async def as_form(cls, request: Request) -> "DAGForm":
         form_data = await request.form()
         prompt = form_data.get("prompt")
         negative_prompt = form_data.get("negative_prompt")
@@ -32,27 +32,23 @@ class DAG(BaseModel):
         cfg_scale = float(form_data.get("cfg_scale", 7.5))
         return cls(
             nodes={
-                "0": CompelNode(
-                    CompelInputs(
-                        prompt=prompt,
-                        negative_prompt=negative_prompt,
-                        model=model,
-                        lightning=lightning,
-                        next_nodes=["1"],
-                    )
+                "0": CompelInputs(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    model=model,
+                    lightning=lightning,
+                    next_nodes=["1"],
                 ),
-                "1": Text2ImageNode(
-                    Text2ImageInputs(
-                        compel_embeds=None,
-                        model=model,
-                        width=width,
-                        height=height,
-                        steps=steps,
-                        cfg_scale=cfg_scale,
-                        dependencies=["0"],
-                    )
+                "1": Text2ImageInputs(
+                    compel_embeds=None,
+                    model=model,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    cfg_scale=cfg_scale,
+                    dependencies=["0"],
                 ),
-            },
+            }
         )
 
 

@@ -7,10 +7,11 @@ import zipfile
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from src.nodes.text2image import Text2ImageNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
 from src.nodes.compel_node import CompelNode
-from src.models import DAG, ImageRequest
+from src.models import DAGForm, ImageRequest
 from compel import CompelForSDXL
 from diffusers import (
     AutoPipelineForImage2Image,
@@ -412,9 +413,13 @@ def get_models():
 
 
 @app.post("/workflows/")
-def execute_workflows(request: DAG = Depends(DAG.as_form)):
+def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
+    compelNode = CompelNode(**request.nodes["0"].model_dump())
+    imageNode = Text2ImageNode(**request.nodes["1"].model_dump())
 
-    response = execute_dag(request.nodes, context={})
+    nodes = {"1": compelNode, "2": imageNode}
+
+    response = execute_dag(nodes, context={})
 
     return Response(
         content=response,

@@ -1,9 +1,10 @@
 from heapq import heappop, heappush, heapify
 from collections import defaultdict
 from src.nodes.base_node import BaseNode
+from src.models import DAGForm, BaseModel
 
 
-def execute_dag(dag: dict[str, BaseNode], context: dict):
+def execute_dag(dag: dict[str, BaseModel], context: dict):
     """
     Executes the given DAG respecting dependencies and context propagation.
 
