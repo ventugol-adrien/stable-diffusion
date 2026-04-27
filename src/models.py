@@ -30,6 +30,7 @@ class DAGForm(BaseModel):
         height = int(form_data.get("height", 1024))
         steps = int(form_data.get("steps", 30))
         cfg_scale = float(form_data.get("cfg_scale", 7.5))
+        num_images_per_prompt = int(form_data.get("batch_size", 1))
         return cls(
             nodes={
                 "0": CompelInputs(
@@ -40,6 +41,7 @@ class DAGForm(BaseModel):
                     next_nodes=["1"],
                 ),
                 "1": Text2ImageInputs(
+                    num_images_per_prompt=num_images_per_prompt,
                     model=model,
                     width=width,
                     height=height,

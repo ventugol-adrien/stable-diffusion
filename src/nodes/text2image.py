@@ -10,6 +10,9 @@ class Text2ImageInputs(BaseNodeModel):
     steps: int = Field(30, description="Number of steps for image generation")
     cfg_scale: float = Field(7.5, description="CFG scale for image generation")
     model: str = Field("juggernaut", description="Model to use for image generation")
+    num_images_per_prompt: int = Field(
+        1, description="Number of images to generate per prompt"
+    )
     model_config = ConfigDict(extra="allow")
 
 
@@ -20,18 +23,19 @@ class Text2ImageNode(BaseNode):
         self.node_type = "text2image"
         self.embeds = None
 
-    def __call__(self, *args, **kwargs) -> list[Image.Image]:
+    def __call__(self, *args, **kwargs) -> dict[str, list[Image.Image]]:
         pipe_kwargs = {
             "width": self.params.width,
             "height": self.params.height,
             "num_inference_steps": self.params.steps,
             "guidance_scale": self.params.cfg_scale,
+            "num_images_per_prompt": self.params.num_images_per_prompt,
         }
         if self.embeds is not None:
             pipe_kwargs.update(self.embeds)
         pipe_kwargs.update(kwargs)
         pipe = get_pipe(self.params.model)
-        return pipe(**pipe_kwargs).images
+        return {"images": pipe(**pipe_kwargs).images}
 
     def __enter__(self, *args, **kwds):
         super().__enter__(*args, **kwds)

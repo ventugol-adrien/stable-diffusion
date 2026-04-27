@@ -7,6 +7,7 @@ import zipfile
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from src.nodes.response_node import ResponseNode
 from src.nodes.text2image import Text2ImageNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
@@ -414,16 +415,17 @@ def get_models():
 
 @app.post("/workflows/")
 def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
+    # 1: Take DAGForm input and initialize node instances
     compel_node = CompelNode(request.nodes["0"])
     image_node = Text2ImageNode(request.nodes["1"])
+    response_node = ResponseNode()
+    # Sort in topological order if needed (currently hardcoded)
+
+    # 2: Execute nodes in order, passing outputs as dicts and unpacking them as kwargs for the next node's call.
+    # This allows for flexible data flow between nodes without strict typing.
 
     embeds = compel_node()
     images = image_node(**embeds)
+    response = response_node(**images)
 
-    img_buffer = io.BytesIO()
-    images[0].save(img_buffer, format="PNG")
-    return Response(
-        content=img_buffer.getvalue(),
-        media_type="image/png",
-        headers={"Content-Disposition": "inline; filename=image.png"},
-    )
+    return response
