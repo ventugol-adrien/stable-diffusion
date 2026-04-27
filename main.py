@@ -414,15 +414,16 @@ def get_models():
 
 @app.post("/workflows/")
 def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
-    compelNode = CompelNode(request.nodes["0"])
-    imageNode = Text2ImageNode(request.nodes["1"])
+    compel_node = CompelNode(request.nodes["0"])
+    image_node = Text2ImageNode(request.nodes["1"])
 
-    nodes = {"1": compelNode, "2": imageNode}
+    embeds = compel_node()
+    images = image_node(**embeds)
 
-    response = execute_dag(nodes, context={})
-
+    img_buffer = io.BytesIO()
+    images[0].save(img_buffer, format="PNG")
     return Response(
-        content=response,
+        content=img_buffer.getvalue(),
         media_type="image/png",
         headers={"Content-Disposition": "inline; filename=image.png"},
     )

@@ -18,15 +18,20 @@ class Text2ImageNode(BaseNode):
         super().__init__(**inputs.model_dump())
         self.params = inputs
         self.node_type = "text2image"
+        self.embeds = None
 
     def __call__(self, *args, **kwargs) -> list[Image.Image]:
-        # Placeholder for actual image generation logic
-        print(f"Generating image with kwargs: {kwargs}")
-        pipe = get_pipe()
-        if super().is_terminal():
-            return pipe(**kwargs).images
-        else:
-            return pipe(**kwargs).images
+        pipe_kwargs = {
+            "width": self.params.width,
+            "height": self.params.height,
+            "num_inference_steps": self.params.steps,
+            "guidance_scale": self.params.cfg_scale,
+        }
+        if self.embeds is not None:
+            pipe_kwargs.update(self.embeds)
+        pipe_kwargs.update(kwargs)
+        pipe = get_pipe(self.params.model)
+        return pipe(**pipe_kwargs).images
 
     def __enter__(self, *args, **kwds):
         super().__enter__(*args, **kwds)

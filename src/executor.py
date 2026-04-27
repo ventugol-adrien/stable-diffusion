@@ -1,7 +1,6 @@
 from heapq import heappop, heappush, heapify
 from collections import defaultdict
-from src.nodes.base_node import BaseNode
-from src.models import DAGForm, BaseModel
+from src.models import BaseModel
 
 
 def execute_dag(dag: dict[str, BaseModel], context: dict):
@@ -37,14 +36,13 @@ def execute_dag(dag: dict[str, BaseModel], context: dict):
         node_id = heappop(source_heap)
         current_node = dag[node_id]
 
-        # Execute node with current context
-        result = current_node(**current_node.params.model_dump(), **context)
+        # Execute node
+        result = current_node()
         results[node_id] = result
 
-        # Propagate results to dependent nodes
+        # Store result for downstream consumers
+        current_node.propagate_context(result, context, dag)
         for dependent_id in graph[node_id]:
-            if dependent_id not in results:
-                context[dependent_id] = result.model_dump()
             heappush(source_heap, dependent_id)
 
     # Return results from terminal nodes

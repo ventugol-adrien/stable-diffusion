@@ -40,7 +40,6 @@ class DAGForm(BaseModel):
                     next_nodes=["1"],
                 ),
                 "1": Text2ImageInputs(
-                    compel_embeds=None,
                     model=model,
                     width=width,
                     height=height,
