@@ -414,8 +414,8 @@ def get_models():
 
 @app.post("/workflows/")
 def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
-    compelNode = CompelNode(**request.nodes["0"].model_dump())
-    imageNode = Text2ImageNode(**request.nodes["1"].model_dump())
+    compelNode = CompelNode(request.nodes["0"])
+    imageNode = Text2ImageNode(request.nodes["1"])
 
     nodes = {"1": compelNode, "2": imageNode}
 
