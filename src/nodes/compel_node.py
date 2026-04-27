@@ -42,10 +42,10 @@ class CompelNode(BaseNode):
         conditioning = compel_proc(positive_prompt, negative_prompt=negative_prompt)
         # Placeholder for actual image generation logic
         embeds = {
-            "prompt_embeds": conditioning.prompt_embeds,
-            "pooled_prompt_embeds": conditioning.pooled_prompt_embeds,
-            "negative_prompt_embeds": conditioning.negative_prompt_embeds,
-            "negative_pooled_prompt_embeds": conditioning.negative_pooled_prompt_embeds,
+            "prompt_embeds": conditioning.embeds,
+            "pooled_prompt_embeds": conditioning.pooled_embeds,
+            "negative_prompt_embeds": conditioning.negative_embeds,
+            "negative_pooled_prompt_embeds": conditioning.negative_pooled_embeds,
         }
 
         return CompelOutputs(**embeds)
@@ -56,6 +56,6 @@ class CompelNode(BaseNode):
             pass
 
     def __exit__(self, *args, **kwds):
-        print(f"Exiting context for node: {self} with params: {self.params}")
-        # Cleanup resources if needed
-        pass
+        super().__exit__(*args, **kwds)
+        if self.is_terminal():
+            pass
