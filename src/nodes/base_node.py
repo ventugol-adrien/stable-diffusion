@@ -1,5 +1,6 @@
 import time
 import functools
+import torch
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -10,6 +11,25 @@ def timed(func):
         result = func(self, *args, **kwargs)
         elapsed = time.perf_counter() - start
         print(f"[{self.__class__.__name__}] executed in {elapsed:.3f}s")
+        return result
+
+    return wrapper
+
+
+def vram_added(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_allocated()
+        result = func(self, *args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_allocated()
+            delta_mb = (after - before) / 1024**2
+            print(
+                f"[{self.__class__.__name__}] VRAM delta: {delta_mb:+.1f} MB (total: {after / 1024 ** 2:.1f} MB)"
+            )
         return result
 
     return wrapper
@@ -27,7 +47,7 @@ class BaseNode:
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "__call__" in cls.__dict__:
-            cls.__call__ = timed(cls.__call__)
+            cls.__call__ = vram_added(timed(cls.__call__))
 
     def __init__(self, **kwargs):
         base_node_data = BaseNodeModel(**kwargs)
