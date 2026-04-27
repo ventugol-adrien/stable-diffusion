@@ -6,6 +6,7 @@ from fastapi import Request, UploadFile, File
 
 from src.nodes.compel_node import CompelInputs, CompelNode
 from src.nodes.text2image import Text2ImageInputs, Text2ImageNode
+from src.nodes.image2image import Image2ImageInputs, Image2ImageNode
 from src.nodes.base_node import BaseNode
 
 
@@ -31,6 +32,9 @@ class DAGForm(BaseModel):
         steps = int(form_data.get("steps", 30))
         cfg_scale = float(form_data.get("cfg_scale", 7.5))
         num_images_per_prompt = int(form_data.get("batch_size", 1))
+        init_image = form_data.get("init_image")
+        strength = float(form_data.get("strength", 0.0))
+
         return cls(
             nodes={
                 "0": CompelInputs(
@@ -47,7 +51,19 @@ class DAGForm(BaseModel):
                     height=height,
                     steps=steps,
                     cfg_scale=cfg_scale,
+                    output_type="pt",
                     dependencies=["0"],
+                    next_nodes=["2"],
+                ),
+                "2": Image2ImageInputs(
+                    num_images_per_prompt=num_images_per_prompt,
+                    model=model,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    cfg_scale=cfg_scale,
+                    strength=strength,
+                    dependencies=["1"],
                 ),
             }
         )

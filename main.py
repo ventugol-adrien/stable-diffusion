@@ -7,6 +7,7 @@ import zipfile
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from src.nodes.image2image import Image2ImageNode
 from src.nodes.response_node import ResponseNode
 from src.nodes.text2image import Text2ImageNode
 from src.executor import execute_dag
@@ -418,6 +419,7 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
     # 1: Take DAGForm input and initialize node instances
     compel_node = CompelNode(request.nodes["0"])
     image_node = Text2ImageNode(request.nodes["1"])
+    i2i_node = Image2ImageNode(request.nodes["2"])
     response_node = ResponseNode()
     # Sort in topological order if needed (currently hardcoded)
 
@@ -426,6 +428,5 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
 
     embeds = compel_node()
     images = image_node(**embeds)
-    response = response_node(**images)
-
-    return response
+    refined_images = i2i_node(**images, **embeds, strength=request.nodes["2"].strength)
+    return response_node(**refined_images)

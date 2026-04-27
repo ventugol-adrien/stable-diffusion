@@ -1,3 +1,4 @@
+from typing import Literal
 from pydantic import Field, ConfigDict
 from PIL import Image
 from src.pipeline import get_pipe
@@ -12,6 +13,9 @@ class Text2ImageInputs(BaseNodeModel):
     model: str = Field("juggernaut", description="Model to use for image generation")
     num_images_per_prompt: int = Field(
         1, description="Number of images to generate per prompt"
+    )
+    output_type: Literal["pil", "pt"] = Field(
+        "pil", description="Output type: 'pil' for PIL images, 'pt' for PyTorch tensors"
     )
     model_config = ConfigDict(extra="allow")
 
@@ -30,6 +34,7 @@ class Text2ImageNode(BaseNode):
             "num_inference_steps": self.params.steps,
             "guidance_scale": self.params.cfg_scale,
             "num_images_per_prompt": self.params.num_images_per_prompt,
+            "output_type": self.params.output_type,
         }
         if self.embeds is not None:
             pipe_kwargs.update(self.embeds)
