@@ -17,6 +17,7 @@ class Text2ImageNode(BaseNode):
     def __init__(self, inputs: Text2ImageInputs):
         super().__init__(**inputs.model_dump())
         self.params = inputs
+        self.node_type = "text2image"
 
     def __call__(self, *args, **kwargs) -> list[Image.Image]:
         # Placeholder for actual image generation logic

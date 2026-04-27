@@ -8,7 +8,7 @@ from compel import CompelForSDXL
 
 
 class CompelInputs(BaseNodeModel):
-    prompt: list[str] = Field(..., description="Text prompt for image generation")
+    prompt: list[str] | str = Field(..., description="Text prompt for image generation")
     model: str = Field("juggernaut", description="Model to use for image generation")
     model_config = ConfigDict(extra="allow")
 
@@ -30,6 +30,7 @@ class CompelNode(BaseNode):
     def __init__(self, inputs: CompelInputs):
         super().__init__(**inputs.model_dump())
         self.params = inputs
+        self.node_type = "compel"
 
     def __call__(self, *args, **kwargs):
         super().__call__(*args, **kwargs)
