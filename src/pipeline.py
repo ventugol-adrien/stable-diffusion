@@ -4,6 +4,7 @@ from diffusers import (
     StableDiffusionXLImg2ImgPipeline,
     AutoPipelineForImage2Image,
     EulerAncestralDiscreteScheduler,
+    DPMSolverMultistepScheduler,
     AutoencoderKL,
 )
 from pathlib import Path
@@ -128,7 +129,7 @@ def get_pipe(model: str = "juggernaut"):
 
     # 4. SCHEDULER OPTIMIZATION
     # Euler Ancestral is fast and widely compatible.
-    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 
     # 5. MEMORY EFFICIENT ATTENTION
     # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)

@@ -29,7 +29,7 @@ class DAGForm(BaseModel):
         lightning = form_data.get("lightning", "false").lower() == "true"
         width = int(form_data.get("width", 1024))
         height = int(form_data.get("height", 1024))
-        steps = int(form_data.get("steps", 30))
+        steps = int(form_data.get("steps", 50))
         cfg_scale = float(form_data.get("cfg_scale", 7.5))
         num_images_per_prompt = int(form_data.get("batch_size", 1))
         init_image = form_data.get("init_image")

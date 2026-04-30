@@ -8,7 +8,7 @@ from src.nodes.base_node import BaseNode, BaseNodeModel
 class Text2ImageInputs(BaseNodeModel):
     width: int = Field(1024, description="Width of the generated image")
     height: int = Field(1024, description="Height of the generated image")
-    steps: int = Field(30, description="Number of steps for image generation")
+    steps: int = Field(50, description="Number of steps for image generation")
     cfg_scale: float = Field(7.5, description="CFG scale for image generation")
     model: str = Field("juggernaut", description="Model to use for image generation")
     num_images_per_prompt: int = Field(
@@ -40,6 +40,8 @@ class Text2ImageNode(BaseNode):
             pipe_kwargs.update(self.embeds)
         pipe_kwargs.update(kwargs)
         pipe = get_pipe(self.params.model)
+        print(pipe.__class__.__name__)
+        print(pipe.scheduler.__class__.__name__)
         return {"images": pipe(**pipe_kwargs).images}
 
     def __enter__(self, *args, **kwds):
