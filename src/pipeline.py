@@ -128,7 +128,6 @@ def get_pipe(model: str = "juggernaut"):
     )
 
     # 4. SCHEDULER OPTIMIZATION
-    # Euler Ancestral is fast and widely compatible.
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
 
     # 5. MEMORY EFFICIENT ATTENTION

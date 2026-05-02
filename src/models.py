@@ -1,8 +1,12 @@
+import io
 import os
+import base64
 import json
 from typing import Literal
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Request, UploadFile, File
+from PIL import Image
 
 from src.nodes.compel_node import CompelInputs, CompelNode
 from src.nodes.text2image import Text2ImageInputs, Text2ImageNode
@@ -17,8 +21,29 @@ class TransformParams(BaseModel):
     r: float = Field(0.0, ge=-360.0, le=360.0)
 
 
+async def _decode_init_image(value) -> Image.Image | None:
+    if value is None:
+        return None
+    if hasattr(value, "read"):  # UploadFile
+        data = await value.read()
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    if isinstance(value, str):
+        if value.startswith("data:"):
+            _, encoded = value.split(",", 1)
+            return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(value, timeout=30)
+            resp.raise_for_status()
+            return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    return None
+
+
 class DAGForm(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     nodes: dict[str, BaseModel] = Field(..., description="List of nodes in the DAG")
+    init_image: Image.Image | None = None
+    hires_strength: float = 0.35
 
     @classmethod
     async def as_form(cls, request: Request) -> "DAGForm":
@@ -32,10 +57,39 @@ class DAGForm(BaseModel):
         steps = int(form_data.get("steps", 50))
         cfg_scale = float(form_data.get("cfg_scale", 7.5))
         num_images_per_prompt = int(form_data.get("batch_size", 1))
-        init_image = form_data.get("init_image")
-        strength = float(form_data.get("strength", 0.0))
+        init_image_raw = form_data.get("init_image")
+        strength = float(form_data.get("strength", 0.75))
+        hires_strength = float(form_data.get("hires_strength", 0.35))
+        decoded_init_image = await _decode_init_image(init_image_raw)
+
+        if decoded_init_image is not None:
+            node1: Text2ImageInputs | Image2ImageInputs = Image2ImageInputs(
+                num_images_per_prompt=num_images_per_prompt,
+                model=model,
+                width=width,
+                height=height,
+                steps=steps,
+                cfg_scale=cfg_scale,
+                strength=strength,
+                dependencies=["0"],
+                next_nodes=["2"],
+            )
+        else:
+            node1 = Text2ImageInputs(
+                num_images_per_prompt=num_images_per_prompt,
+                model=model,
+                width=width,
+                height=height,
+                steps=steps,
+                cfg_scale=cfg_scale,
+                output_type="pt",
+                dependencies=["0"],
+                next_nodes=["2"],
+            )
 
         return cls(
+            init_image=decoded_init_image,
+            hires_strength=hires_strength,
             nodes={
                 "0": CompelInputs(
                     prompt=prompt,
@@ -44,17 +98,7 @@ class DAGForm(BaseModel):
                     lightning=lightning,
                     next_nodes=["1"],
                 ),
-                "1": Text2ImageInputs(
-                    num_images_per_prompt=num_images_per_prompt,
-                    model=model,
-                    width=width,
-                    height=height,
-                    steps=steps,
-                    cfg_scale=cfg_scale,
-                    output_type="pt",
-                    dependencies=["0"],
-                    next_nodes=["2"],
-                ),
+                "1": node1,
                 "2": Image2ImageInputs(
                     num_images_per_prompt=num_images_per_prompt,
                     model=model,
@@ -65,7 +109,7 @@ class DAGForm(BaseModel):
                     strength=strength,
                     dependencies=["1"],
                 ),
-            }
+            },
         )
 
 

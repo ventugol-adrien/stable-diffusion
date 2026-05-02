@@ -7,12 +7,16 @@ import zipfile
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from src.nodes.image2image import Image2ImageNode
+from src.nodes.tiling_node import TilingInputs, TilingNode
+from src.nodes.upscale_node import UpscaleInputs, UpscaleNode
+from src.nodes.hi_res_node import HiResInputs, HiResNode
+from src.nodes.transform_node import TransformInputs, TransformNode
+from src.nodes.image2image import Image2ImageNode, Image2ImageInputs
 from src.nodes.response_node import ResponseNode
 from src.nodes.text2image import Text2ImageNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
-from src.nodes.compel_node import CompelNode
+from src.nodes.compel_node import CompelNode, CompelInputs
 from src.models import DAGForm, ImageRequest
 from compel import CompelForSDXL
 from diffusers import (
@@ -416,17 +420,41 @@ def get_models():
 
 @app.post("/workflows/")
 def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
-    # 1: Take DAGForm input and initialize node instances
-    compel_node = CompelNode(request.nodes["0"])
-    image_node = Text2ImageNode(request.nodes["1"])
-    i2i_node = Image2ImageNode(request.nodes["2"])
-    response_node = ResponseNode()
-    # Sort in topological order if needed (currently hardcoded)
+    model = request.nodes["1"].model
+    hires_strength = request.hires_strength
 
-    # 2: Execute nodes in order, passing outputs as dicts and unpacking them as kwargs for the next node's call.
-    # This allows for flexible data flow between nodes without strict typing.
+    _HIRES_PROMPT = (
+        "masterpiece, ultra-detailed, sharp focus, 8k, photorealistic, "
+        "intricate textures, subsurface scattering, fine detail, crisp"
+    )
+    _HIRES_NEGATIVE = (
+        "blurry, soft focus, low resolution, jpeg artifacts, "
+        "watermark, oversmoothed, deformed"
+    )
+
+    compel_node = CompelNode(request.nodes["0"])
+    hires_compel_node = CompelNode(
+        CompelInputs(prompt=_HIRES_PROMPT, negative_prompt=_HIRES_NEGATIVE, model=model)
+    )
+    if request.init_image is not None:
+        image_node = Image2ImageNode(request.nodes["1"])
+    else:
+        image_node = Text2ImageNode(request.nodes["1"])
+    upscale_node = UpscaleNode(UpscaleInputs(scale=4))
+    tiling_node = TilingNode(TilingInputs())
+    hires_node = HiResNode(HiResInputs(strength=hires_strength, model=model))
+    transform_node = TransformNode(TransformInputs())
+    response_node = ResponseNode()
 
     embeds = compel_node()
-    images = image_node(**embeds)
-    refined_images = i2i_node(**images, **embeds, strength=request.nodes["2"].strength)
-    return response_node(**refined_images)
+    hires_embeds = hires_compel_node()
+    if request.init_image is not None:
+        images = image_node(images=[request.init_image], **embeds)
+    else:
+        images = image_node(**embeds)
+    upscaled = upscale_node(**images)
+    tiling_plan = tiling_node(**upscaled)
+    hires_node.embeds = hires_embeds
+    hires_images = hires_node(tiling_outputs=tiling_plan)
+    final_images = transform_node(**hires_images)
+    return response_node(**final_images)
