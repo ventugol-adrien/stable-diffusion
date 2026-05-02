@@ -1,4 +1,6 @@
 from typing import Literal
+import torch
+import numpy as np
 from pydantic import Field, ConfigDict
 from PIL import Image
 from src.pipeline import get_pipe
@@ -42,7 +44,20 @@ class Text2ImageNode(BaseNode):
         pipe = get_pipe(self.params.model)
         print(pipe.__class__.__name__)
         print(pipe.scheduler.__class__.__name__)
-        return {"images": pipe(**pipe_kwargs).images}
+        output = pipe(**pipe_kwargs).images
+        if isinstance(output, torch.Tensor):
+            output = [
+                Image.fromarray(
+                    (img.float().clamp(0, 1) * 255)
+                    .byte()
+                    .permute(1, 2, 0)
+                    .cpu()
+                    .numpy(),
+                    mode="RGB",
+                )
+                for img in output
+            ]
+        return {"images": output}
 
     def __enter__(self, *args, **kwds):
         super().__enter__(*args, **kwds)

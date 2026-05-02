@@ -71,8 +71,10 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
     if (cached_dir / "model_index.json").is_file():
         print(f"⚡ Loading from diffusers cache: {cached_dir}")
         t0 = time.monotonic()
+        vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
         pipe = StableDiffusionXLPipeline.from_pretrained(
             cached_dir,
+            vae=vae,
             torch_dtype=DTYPE,
             use_safetensors=True,
         )
@@ -120,15 +122,20 @@ def get_pipe(model: str = "juggernaut"):
     print(f"🚀 Initializing Optimized Pipeline for L40S (Ada Lovelace)...")
 
     pipe = _load_pipeline(model)
-    pipe.enable_freeu(
-        s1=0.9,  # Skip connection scaling factor for stage 1
-        s2=0.2,  # Skip connection scaling factor for stage 2
-        b1=1.3,  # Backbone scaling factor for stage 1
-        b2=1.4,  # Backbone scaling factor for stage 2
-    )
 
-    # 4. SCHEDULER OPTIMIZATION
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    # 4. SCHEDULER
+    try:
+        scheduler_config = dict(pipe.scheduler.config)
+
+        if any(k in model.lower() for k in ("vpred", "noob", "illustrious")):
+            scheduler_config["prediction_type"] = "v_prediction"
+            print(f"  [Scheduler] Configured for v-prediction for model: {model}")
+
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            scheduler_config, use_karras_sigmas=True
+        )
+    except TypeError:
+        pass
 
     # 5. MEMORY EFFICIENT ATTENTION
     # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)
@@ -165,7 +172,7 @@ def warmup_pipeline(
             )
         # Also warm up VAE decode (different kernel shapes)
         dummy_latent = torch.randn(
-            1, 4, height // 8, width // 8, device="cuda", dtype=DTYPE
+            1, 4, height // 8, width // 8, device="cuda", dtype=pipe.vae.dtype
         )
         with torch.no_grad():
             pipe.vae.decode(dummy_latent)

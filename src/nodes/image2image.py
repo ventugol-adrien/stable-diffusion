@@ -47,9 +47,23 @@ class Image2ImageNode(BaseNode):
             "guidance_scale": self.params.cfg_scale,
             "num_images_per_prompt": self.params.num_images_per_prompt,
             "strength": self.params.strength,
+            "output_type": self.params.output_type,
         }
         if self.embeds is not None:
             pipe_kwargs.update(self.embeds)
         pipe_kwargs.update(kwargs)
         pipe = AutoPipelineForImage2Image.from_pipe(get_pipe(self.params.model))
-        return {"images": pipe(**pipe_kwargs).images}
+        output = pipe(**pipe_kwargs).images
+        if isinstance(output, torch.Tensor):
+            output = [
+                Image.fromarray(
+                    (img.float().clamp(0, 1) * 255)
+                    .byte()
+                    .permute(1, 2, 0)
+                    .cpu()
+                    .numpy(),
+                    mode="RGB",
+                )
+                for img in output
+            ]
+        return {"images": output}

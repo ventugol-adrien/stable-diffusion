@@ -458,3 +458,21 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
     hires_images = hires_node(tiling_outputs=tiling_plan)
     final_images = transform_node(**hires_images)
     return response_node(**final_images)
+
+
+@app.post("/workflows/image/")
+def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
+
+    compel_node = CompelNode(request.nodes["0"])
+    if request.init_image is not None:
+        image_node = Image2ImageNode(request.nodes["1"])
+    else:
+        image_node = Text2ImageNode(request.nodes["1"])
+    response_node = ResponseNode()
+
+    embeds = compel_node()
+    if request.init_image is not None:
+        images = image_node(images=[request.init_image], **embeds)
+    else:
+        images = image_node(**embeds)
+    return response_node(**images)

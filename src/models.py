@@ -57,6 +57,7 @@ class DAGForm(BaseModel):
         steps = int(form_data.get("steps", 50))
         cfg_scale = float(form_data.get("cfg_scale", 7.5))
         num_images_per_prompt = int(form_data.get("batch_size", 1))
+        output_type = form_data.get("output_type", "pil")
         init_image_raw = form_data.get("init_image")
         strength = float(form_data.get("strength", 0.75))
         hires_strength = float(form_data.get("hires_strength", 0.35))
@@ -71,6 +72,7 @@ class DAGForm(BaseModel):
                 steps=steps,
                 cfg_scale=cfg_scale,
                 strength=strength,
+                output_type=output_type,
                 dependencies=["0"],
                 next_nodes=["2"],
             )
@@ -82,7 +84,7 @@ class DAGForm(BaseModel):
                 height=height,
                 steps=steps,
                 cfg_scale=cfg_scale,
-                output_type="pt",
+                output_type=output_type,
                 dependencies=["0"],
                 next_nodes=["2"],
             )
@@ -107,6 +109,7 @@ class DAGForm(BaseModel):
                     steps=steps,
                     cfg_scale=cfg_scale,
                     strength=strength,
+                    output_type=output_type,
                     dependencies=["1"],
                 ),
             },

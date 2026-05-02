@@ -2,6 +2,7 @@ import io
 import json
 import zipfile
 
+import torch
 from fastapi.responses import Response
 from PIL import Image
 from pydantic import Field, ConfigDict
@@ -23,9 +24,32 @@ class ResponseNode(BaseNode):
         self.params = inputs
         self.node_type = "response"
 
+    @staticmethod
+    def _to_pil(image: Image.Image | torch.Tensor) -> Image.Image:
+        if isinstance(image, torch.Tensor):
+            arr = (
+                (image.float().clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
+            )
+            return Image.fromarray(arr, mode="RGB")
+        return image
+
     def __call__(
-        self, images: list[Image.Image], data: dict = {}, *args, **kwargs
+        self, images: list[Image.Image | torch.Tensor], data: dict = {}, *args, **kwargs
     ) -> Response:
+        print(
+            f"[ResponseNode] received {len(images)} image(s), types: {[type(img).__name__ for img in images]}"
+        )
+        for i, img in enumerate(images):
+            if isinstance(img, torch.Tensor):
+                print(
+                    f"[ResponseNode] image[{i}] is Tensor shape={tuple(img.shape)} dtype={img.dtype}"
+                )
+            else:
+                print(
+                    f"[ResponseNode] image[{i}] is {type(img).__name__} size={getattr(img, 'size', '?')}"
+                )
+        images = [self._to_pil(img) for img in images]
+        print(f"[ResponseNode] after _to_pil: {[type(img).__name__ for img in images]}")
         if len(images) == 1:
             buf = io.BytesIO()
             images[0].save(buf, format="PNG")
