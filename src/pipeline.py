@@ -67,14 +67,13 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
     """
     cached_dir = MODEL_CACHE_DIR / model
 
-    # FAST PATH: diffusers cache exists
+    # FAST PATH: diffusers cache exists (VAE is already madebyollin/sdxl-vae-fp16-fix,
+    # baked in when the cache was saved — no need to reload it from HF hub)
     if (cached_dir / "model_index.json").is_file():
         print(f"⚡ Loading from diffusers cache: {cached_dir}")
         t0 = time.monotonic()
-        vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
         pipe = StableDiffusionXLPipeline.from_pretrained(
             cached_dir,
-            vae=vae,
             torch_dtype=DTYPE,
             use_safetensors=True,
         )
@@ -141,8 +140,44 @@ def get_pipe(model: str = "juggernaut"):
     # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)
     print("🔥 Pipeline Ready. Using FlashAttention 2 (via PyTorch SDPA).")
 
-    # 6. TRANSFER TO GPU
-    pipe.to("cuda")
+    # 6. MEMORY PRESSURE MITIGATIONS (configured before GPU placement)
+    # Base the decision on total VRAM capacity — memory_allocated() is unreliable on ROCm
+    # immediately after model load. SDXL weights consume ~10 GB, so on GPUs ≤ 24 GB
+    # memory management is required. Attention slicing must never be used on ROCm because
+    # torch.baddbmm triggers an illegal memory access in SlicedAttnProcessor.
+    from src.utils import vram_gb, is_rocm
+
+    use_cpu_offload = is_rocm() and vram_gb() < 24.0
+
+    if vram_gb() < 24.0:
+        if use_cpu_offload:
+            # enable_model_cpu_offload offloads UNet to CPU before VAE runs, so the VAE
+            # has the full VRAM budget. VAE tiling conflicts with accelerate's GPU hooks
+            # and causes a ROCm kernel hang — disable it; VRAM headroom is sufficient.
+            print(
+                f"⚠️  GPU has {vram_gb():.1f} GB VRAM — enabling VAE slicing (tiling disabled; CPU offload handles headroom)."
+            )
+            pipe.vae.disable_tiling()
+            pipe.vae.enable_slicing()
+        else:
+            print(
+                f"⚠️  GPU has {vram_gb():.1f} GB VRAM — enabling VAE tiling and slicing."
+            )
+            pipe.vae.enable_tiling()
+            pipe.vae.enable_slicing()
+    else:
+        pipe.vae.disable_tiling()
+        pipe.vae.disable_slicing()
+
+    # 7. TRANSFER TO GPU
+    # On ROCm with limited VRAM, use enable_model_cpu_offload(): each sub-model
+    # (text_encoders → unet → vae) is loaded to GPU just-in-time and offloaded after use.
+    # On NVIDIA or ≥ 24 GB GPU, keep everything resident on the GPU for speed.
+    if use_cpu_offload:
+        print("🔀 ROCm + limited VRAM → using model CPU offload.")
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to("cuda")
 
     _cached_pipe = pipe
     _cached_model_name = model
@@ -157,7 +192,9 @@ def warmup_pipeline(
     height: int = 1024,
 ):
     def run_warmup():
-        # Run a single forward pass with dummy data to warm up the model
+        # Run a single UNet forward pass to warm up MIOpen/TunableOp kernels.
+        # output_type="latent" skips VAE decode — VAE slicing + accelerate CPU offload
+        # hooks cause a ROCm kernel hang (same class of issue as tiling; see get_pipe).
         generator = torch.Generator("cuda").manual_seed(42)
         with torch.no_grad():
             pipe(
@@ -170,14 +207,6 @@ def warmup_pipeline(
                 generator=generator,
                 output_type="latent",
             )
-        # Also warm up VAE decode (different kernel shapes)
-        dummy_latent = torch.randn(
-            1, 4, height // 8, width // 8, device="cuda", dtype=pipe.vae.dtype
-        )
-        with torch.no_grad():
-            pipe.vae.decode(dummy_latent)
-        gc.collect()
-        torch.cuda.empty_cache()
 
     def load_warmup() -> set[str]:
         """Load the set of previously warmed config keys from disk."""
