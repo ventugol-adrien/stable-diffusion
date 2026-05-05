@@ -3,8 +3,11 @@ info:
   title: Stable Diffusion XL Inference Server
   description: >
     High-performance SDXL image generation API optimized for AMD RDNA 4 GPUs.
-    Supports text-to-image, image-to-image, LoRA adapters, and lightning mode.
-  version: 1.0.0
+    Supports text-to-image, image-to-image, multi-ControlNet spatial conditioning,
+    IP-Adapter, heterogeneous batch control (Divergent Spaces), inpainting,
+    LoRA adapters, lightning mode, and node-based hi-res workflow pipelines.
+    All image-accepting endpoints use multipart/form-data.
+  version: 1.1.0
   license:
     name: Proprietary
 servers:
@@ -12,43 +15,42 @@ servers:
     description: Local development server
 
 paths:
-  /generate/image/:
+  /generate/image:
     post:
       operationId: generateImage
       summary: Generate images from a text prompt
       description: >
         Generates one or more SDXL images based on the provided prompt and
-        parameters. Returns a ZIP archive containing the generated PNG images
-        and a `metrics.json` file with timing information.
+        parameters. Supports text-to-image, image-to-image (via `reference`),
+        multi-ControlNet depth/edge conditioning, IP-Adapter, and per-image
+        Divergent Spaces for heterogeneous batch control with optional inpainting.
+
+        Returns a single PNG when `batch_size=1`, or a ZIP archive containing
+        the generated PNG images and a `metrics.json` file when `batch_size>1`.
+
+        **LoRA fields** use dot-notation: `loras.0.name`, `loras.0.scale`, `loras.1.name`, …
+
+        **Divergent Spaces fields** use an index prefix: `0.depth_map`, `0.mask`,
+        `1.canny_edges`, … — the number of indexed items must equal `batch_size`.
+        Including any `{n}.mask` field switches the pipeline to
+        `StableDiffusionXLControlNetInpaintPipeline`.
       requestBody:
         required: true
         content:
-          application/json:
+          multipart/form-data:
             schema:
-              $ref: "#/components/schemas/ImageRequest"
-            examples:
-              basic:
-                summary: Simple text-to-image
-                value:
-                  user_input: "a cat sitting on a windowsill at sunset"
-              lightning:
-                summary: Fast generation with lightning mode
-                value:
-                  user_input: "cyberpunk cityscape at night"
-                  lightning: true
-                  batch_size: 2
-              with_loras:
-                summary: Generation with LoRA adapters
-                value:
-                  user_input: "portrait of a woman in a garden"
-                  model: "juggernaut"
-                  loras:
-                    - name: "detail_enhancer"
-                      scale: 0.7
+              $ref: "#/components/schemas/ImageRequestForm"
       responses:
         "200":
-          description: ZIP archive containing generated images and metrics
+          description: >
+            Single PNG image (batch_size=1) or ZIP archive (batch_size>1)
+            containing generated images and a metrics.json file.
           content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+                description: Generated image when batch_size=1.
             application/zip:
               schema:
                 type: string
@@ -62,6 +64,24 @@ paths:
               schema:
                 type: string
                 example: "attachment; filename=results.zip"
+            X-Metrics-Latency:
+              schema:
+                type: string
+                description: Total wall-clock time in seconds (single-image response only).
+            X-Metrics-Throughput:
+              schema:
+                type: string
+                description: Images per second (single-image response only).
+            X-Metrics-Breakdown:
+              schema:
+                type: string
+                description: JSON-encoded timing breakdown (single-image response only).
+        "400":
+          description: Divergent Spaces count does not match batch_size.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HTTPValidationError"
         "422":
           description: Validation error
           content:
@@ -69,14 +89,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/HTTPValidationError"
 
-  /models/:
+  /models:
     get:
       operationId: listModels
       summary: List available models
       description: >
         Returns an array of model identifiers available for generation.
-        Each identifier corresponds to a `.safetensors` file in the models
-        directory.
+        Each identifier corresponds to a `.safetensors` file in `~/sd_models/`.
       responses:
         "200":
           description: Array of model identifier strings
@@ -87,6 +106,140 @@ paths:
                 items:
                   type: string
               example: ["juggernaut", "pony"]
+
+  /loras/:
+    get:
+      operationId: listLoras
+      summary: List available LoRA adapters
+      description: >
+        Returns an array of LoRA adapter names available for use.
+        Each name corresponds to a `.safetensors` file in `~/sd_loras/`.
+      responses:
+        "200":
+          description: Array of LoRA adapter name strings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+              example: ["detail_enhancer", "style_anime"]
+
+  /spatial-assets/generate:
+    post:
+      operationId: generateSpatialAssets
+      summary: Generate ControlNet conditioning assets
+      description: >
+        Accepts a single image and returns a ZIP archive containing:
+        - A Depth-Anything V3 (DA3) depth map
+        - A PiDiNet crisp edge map
+        - Five foreground/background mask pairs fused from both maps,
+          using different morphological parameters for varied coverage.
+
+        Mask variants: `conservative_baseline`, `conservative_depth_push`,
+        `conservative_tight_edge`, `conservative_deep_smooth`, `conservative_surgical`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - input_image
+              properties:
+                input_image:
+                  type: string
+                  format: binary
+                  description: Source image to generate priors from.
+      responses:
+        "200":
+          description: ZIP archive of ControlNet conditioning assets.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+                description: >
+                  ZIP file (`controlnet_priors.zip`) containing:
+                  - `da3_depth_map.png`
+                  - `matched_edge_map.png`
+                  - `masks/{variant}_foreground.png` (×5)
+                  - `masks/{variant}_background.png` (×5)
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: "attachment; filename=controlnet_priors.zip"
+        "500":
+          description: Asset generation failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  message:
+                    type: string
+
+  /workflows/:
+    post:
+      operationId: executeHiResWorkflow
+      summary: Full hi-res generation workflow
+      description: >
+        Runs a full node-based pipeline: text-to-image (or image-to-image when
+        `init_image` is provided) → 4× upscale → tiling → hi-res refinement pass
+        → spatial transform → response.
+
+        Returns a single PNG when `batch_size=1`, or a ZIP archive for batches.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/WorkflowForm"
+      responses:
+        "200":
+          description: Single PNG or ZIP archive of generated images.
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /workflows/image/:
+    post:
+      operationId: executeImageWorkflow
+      summary: Simple generation workflow (no hi-res pass)
+      description: >
+        Runs a minimal node-based pipeline: text-to-image (or image-to-image when
+        `init_image` is provided) → response. No upscaling or hi-res refinement.
+        The `hires_strength` field is accepted but ignored.
+
+        Returns a single PNG when `batch_size=1`, or a ZIP archive for batches.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/WorkflowForm"
+      responses:
+        "200":
+          description: Single PNG or ZIP archive of generated images.
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
 
 components:
   schemas:
@@ -110,7 +263,7 @@ components:
           description: Adapter influence scale.
           example: 0.7
 
-    ImageRequest:
+    ImageRequestForm:
       type: object
       required:
         - user_input
@@ -123,52 +276,185 @@ components:
           type: string
           default: "juggernaut"
           description: >
-            Model identifier. Must match a `.safetensors` filename in the
-            models directory or a cached diffusers model.
+            Model identifier matching a `.safetensors` filename or a cached
+            diffusers model under `caches/models/`.
           example: "juggernaut"
-        loras:
-          type: array
-          items:
-            $ref: "#/components/schemas/LoRA"
-          default: []
-          description: List of LoRA adapters to apply during generation.
         lightning:
           type: boolean
           default: false
           description: >
-            Enable lightning mode for faster inference (8 steps, CFG 1.5)
-            instead of standard mode (25 steps, CFG 7.0).
+            Enable lightning mode: 8 inference steps at CFG 1.5 instead of
+            30 steps at CFG 7.0.
         batch_size:
           type: integer
           default: 1
           minimum: 1
           description: Number of images to generate per request.
-          example: 1
-        reference:
+        resolution:
           type: string
-          format: byte
-          nullable: true
-          default: null
-          description: >
-            Base64-encoded reference image bytes for image-to-image generation.
-        reference_strength:
-          type: number
-          format: float
-          nullable: true
-          default: null
-          description: Denoising strength for image-to-image (0.0–1.0).
+          enum: ["360p", "480p", "720p", "1080p"]
+          default: "480p"
+          description: Target output resolution.
         image_seed:
           type: integer
           default: -1
-          description: >
-            Seed for the image generation RNG. Use `-1` for a random seed.
-          example: -1
+          description: Seed for the image generation RNG. Use `-1` for a random seed.
         prompt_seed:
           type: integer
           default: -1
+          description: Seed for prompt processing RNG. Use `-1` for a random seed.
+        reference:
+          type: string
+          format: binary
           description: >
-            Seed for prompt processing RNG. Use `-1` for a random seed.
-          example: -1
+            Reference image file for image-to-image generation. Resized to
+            1024×1024 via LANCZOS before processing.
+        strength:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Denoising strength for image-to-image (0.0 = no change, 1.0 = full noise).
+        depth_map:
+          type: string
+          format: binary
+          description: >
+            Depth map image file. Loads the `xinsir/controlnet-depth-sdxl-1.0`
+            ControlNet and conditions on this image.
+        depth_scales:
+          type: array
+          items:
+            type: number
+            format: float
+          description: ControlNet conditioning scale(s) for the depth map. Defaults to 0.5.
+          example: [0.5]
+        canny_edges:
+          type: string
+          format: binary
+          description: >
+            Canny edge map image file. Loads the `xinsir/controlnet-canny-sdxl-1.0`
+            ControlNet and conditions on this image.
+        canny_edges_scales:
+          type: array
+          items:
+            type: number
+            format: float
+          description: ControlNet conditioning scale(s) for the edge map. Defaults to 0.4.
+          example: [0.4]
+        ip_image:
+          type: string
+          format: binary
+          description: >
+            IP-Adapter reference image file. Requires `ip_scale` to be set.
+            Loads `h94/IP-Adapter` with `ip-adapter_sdxl.bin`.
+        ip_scale:
+          type: number
+          format: float
+          description: IP-Adapter influence scale. Requires `ip_image` to be set.
+          example: 0.6
+        final_strength:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Post-generation refinement pass strength.
+        grain_intensity:
+          type: number
+          format: float
+          default: 0.02
+          minimum: 0.0
+          maximum: 0.1
+          description: Film grain intensity applied to the output image.
+      description: >
+        **LoRA fields** (multipart dot-notation):
+        `loras.0.name=<name>`, `loras.0.scale=<float>`, `loras.1.name=<name>`, …
+
+        **Divergent Spaces fields** (indexed per batch item — count must equal `batch_size`):
+
+        | Field | Type | Default | Description |
+        |---|---|---|---|
+        | `{n}.depth_map` | file | — | Per-item depth map |
+        | `{n}.depth_map_scale` | float | 0.6 | Depth ControlNet scale |
+        | `{n}.canny_edges` | file | — | Per-item canny edge map |
+        | `{n}.canny_edges_scale` | float | 0.2 | Canny ControlNet scale |
+        | `{n}.mask` | file | — | Inpaint mask (enables inpainting pipeline) |
+        | `{n}.reference` | file | — | Base image for inpainting |
+        | `{n}.strength` | float | 1.0 | Inpaint denoising strength |
+        | `{n}.ip_image` | file | — | Per-item IP-Adapter image |
+        | `{n}.ip_scale` | float | — | Per-item IP-Adapter scale |
+        | `{n}.transform_input_image` | file | — | Spatial transform input image |
+        | `{n}.transform_dx` | int | — | Horizontal pixel offset |
+        | `{n}.transform_dy` | int | — | Vertical pixel offset |
+        | `{n}.transform_z` | float | — | Zoom factor |
+        | `{n}.transform_r` | float | — | Rotation in degrees |
+        | `{n}.transform_strength` | float | — | Transform blend strength |
+
+    WorkflowForm:
+      type: object
+      required:
+        - prompt
+      properties:
+        prompt:
+          type: string
+          description: Text prompt describing the desired image.
+          example: "a misty mountain landscape at dawn"
+        negative_prompt:
+          type: string
+          description: Negative prompt.
+          example: "blurry, low quality"
+        model:
+          type: string
+          default: "juggernaut"
+          description: Model identifier.
+        lightning:
+          type: boolean
+          default: false
+          description: Enable lightning mode.
+        width:
+          type: integer
+          default: 1024
+          description: Image width in pixels.
+        height:
+          type: integer
+          default: 1024
+          description: Image height in pixels.
+        steps:
+          type: integer
+          default: 50
+          description: Number of diffusion inference steps.
+        cfg_scale:
+          type: number
+          format: float
+          default: 7.5
+          description: Classifier-free guidance scale.
+        batch_size:
+          type: integer
+          default: 1
+          minimum: 1
+          description: Number of images to generate.
+        output_type:
+          type: string
+          enum: ["pil", "pt"]
+          default: "pil"
+          description: Internal output type (`pil` for PIL images, `pt` for PyTorch tensors).
+        init_image:
+          type: string
+          format: binary
+          description: >
+            Optional init image. When provided, switches to image-to-image mode.
+            Accepts a file upload, a base64 data URI, or a URL.
+        strength:
+          type: number
+          format: float
+          default: 0.75
+          description: Denoising strength for image-to-image (0.0–1.0).
+        hires_strength:
+          type: number
+          format: float
+          default: 0.35
+          description: >
+            Strength for the hi-res refinement pass (`/workflows/` only;
+            ignored by `/workflows/image/`).
 
     GenerationMetrics:
       type: object
