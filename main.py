@@ -126,6 +126,7 @@ from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
 
 from src.controlnet import router as depthmap_router
+from src.host import router as host_router
 
 import torch
 
