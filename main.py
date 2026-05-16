@@ -186,10 +186,57 @@ app.add_middleware(
 
 app.include_router(depthmap_router)
 app.include_router(loras_router)
+app.include_router(host_router)
+
+
+async def stream_image(
+    image: Image.Image, chunk_size: int = 1024
+) -> AsyncIterable[bytes]:
+    buffer = io.BytesIO()
+    await asyncio.to_thread(image.save, buffer, format="PNG", interlace=True)
+    total_size = buffer.getbuffer().nbytes
+    buffer.seek(0)
+    bytes_sent = 0
+    while chunk := buffer.read(chunk_size):
+        bytes_sent += len(chunk)
+        percent = (bytes_sent / total_size) * 100
+        bar_length = 30
+        filled_len = int(bar_length * percent // 100)
+        bar = "█" * filled_len + "-" * (bar_length - filled_len)
+        sys.stdout.write(
+            f"\rStreaming: [{bar}] {percent:.1f}% ({bytes_sent}/{total_size} bytes)"
+        )
+        sys.stdout.flush()
+        yield chunk
+        await asyncio.sleep(0)  # Yield control to the event loop for responsiveness
+    print("\nStreaming complete.")
+
+
+async def stream_zip(
+    zip_buffer: io.BytesIO, chunk_size: int = 1024
+) -> AsyncIterable[bytes]:
+    total_size = zip_buffer.getbuffer().nbytes
+    zip_buffer.seek(0)
+    bytes_sent = 0
+    while chunk := zip_buffer.read(chunk_size):
+        bytes_sent += len(chunk)
+        percent = (bytes_sent / total_size) * 100
+        bar_length = 30
+        filled_len = int(bar_length * percent // 100)
+        bar = "█" * filled_len + "-" * (bar_length - filled_len)
+        sys.stdout.write(
+            f"\rStreaming ZIP: [{bar}] {percent:.1f}% ({bytes_sent}/{total_size} bytes)"
+        )
+        sys.stdout.flush()
+        yield chunk
+        await asyncio.sleep(0)  # Yield control to the event loop for responsiveness
+    print("\nStreaming ZIP complete.")
 
 
 @app.post("/generate/image")
-def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form)):
+async def handle_generate_image(
+    request: ImageRequest = Depends(ImageRequest.as_form), stream: bool = False
+):
     breakdown = {}
     start_time = time.monotonic()
 
@@ -499,6 +546,36 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
 
     metrics = {"latency": latency, "throughput": throughput, "breakdown": breakdown}
 
+    if stream:
+        if len(images) == 1:
+            img_buffer = io.BytesIO()
+            image: Image.Image = images[0]
+            if stream:
+                print("Streaming response...")
+                return PNGStreamingResponse(
+                    stream_image(image),
+                    headers={
+                        "Content-Disposition": "inline; filename=result.png",
+                        "X-Metrics-Latency": str(latency),
+                        "X-Metrics-Throughput": str(throughput),
+                        "X-Metrics-Breakdown": json.dumps(breakdown),
+                    },
+                )
+        else:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.writestr("metrics.json", json.dumps(metrics))
+                for i, img in enumerate(images):
+                    img_buffer = io.BytesIO()
+                    img.save(img_buffer, format="PNG")
+                    zip_file.writestr(f"image_{i}.png", img_buffer.getvalue())
+            print("Streaming ZIP response...")
+            return ZipStreamingResponse(
+                stream_zip(zip_buffer),
+                headers={
+                    "Content-Disposition": "attachment; filename=results.zip",
+                },
+            )
     if len(images) == 1:
         img_buffer = io.BytesIO()
         images[0].save(img_buffer, format="PNG")
