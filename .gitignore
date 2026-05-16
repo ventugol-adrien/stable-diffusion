@@ -3,3 +3,5 @@ caches/
 __pycache__/
 test.py
 *.png
+/logs
+tunableop_results0.csv

@@ -156,6 +156,7 @@ class ImageRequest(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
 
     user_input: str
+    negative_input: str = ""
     loras: list[LoRA] = []
     model: str = os.environ.get("DEFAULT_MODEL", "juggernaut")
     strength: float = None

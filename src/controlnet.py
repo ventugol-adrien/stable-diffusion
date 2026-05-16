@@ -84,11 +84,7 @@ class ControlNetAssetGenerator:
 
     @staticmethod
     def _get_optimal_device() -> str:
-        """Determines the best available compute device."""
-        if torch.cuda.is_available():
-            return "cuda"
-        elif torch.backends.mps.is_available():
-            return "mps"
+        """Always run on CPU — GPU is reserved for the SD diffusion pipeline."""
         return "cpu"
 
     def _extract_masks(

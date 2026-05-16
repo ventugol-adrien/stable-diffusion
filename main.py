@@ -1,11 +1,94 @@
-import base64
-from contextlib import asynccontextmanager
-import io, os, json, time
-from random import randint
+import os
+import sys
+from datetime import datetime
 from pathlib import Path
+from src.classes import PNGStreamingResponse, ZipStreamingResponse
+from typing import AsyncIterable
+
+
+class _TeeStream:
+    """Mirror writes to both the original stream and a file."""
+
+    def __init__(self, original_stream, file_handle):
+        self._original_stream = original_stream
+        self._file_handle = file_handle
+
+    def write(self, data):
+        self._original_stream.write(data)
+        self._file_handle.write(data)
+        return len(data)
+
+    def flush(self):
+        self._original_stream.flush()
+        self._file_handle.flush()
+
+    def isatty(self):
+        return self._original_stream.isatty()
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_LOG_DIR = Path(os.environ.get("SD_LOG_DIR", _PROJECT_ROOT / "logs"))
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+_STDOUT_LOG_FILE = _LOG_DIR / f"runtime_{_RUN_ID}.stdout.log"
+_STDERR_LOG_FILE = _LOG_DIR / f"runtime_{_RUN_ID}.stderr.log"
+
+# Capture everything emitted by Python + native libraries to stdout/stderr.
+if os.environ.get("SD_STREAM_LOGS_TO_FILES", "1") == "1":
+    _stdout_fh = open(_STDOUT_LOG_FILE, "a", buffering=1)
+    _stderr_fh = open(_STDERR_LOG_FILE, "a", buffering=1)
+    sys.stdout = _TeeStream(sys.stdout, _stdout_fh)
+    sys.stderr = _TeeStream(sys.stderr, _stderr_fh)
+
+# Route HIP and rocBLAS logs to project-local files for post-mortem analysis.
+os.environ.setdefault("AMD_LOG_LEVEL_FILE", str(_LOG_DIR / f"hip_{_RUN_ID}.log"))
+os.environ.setdefault("ROCBLAS_LOG_PATH", str(_LOG_DIR / f"rocblas_{_RUN_ID}.log"))
+
+# ── ROCm / MIOpen environment overrides ────────────────────────────────────────
+# Only applied on ROCm — CUDA systems don't need or want these variables.
+# Must be set BEFORE torch or diffusers are imported; uvicorn does not source
+# ~/.bashrc so these would be absent from the process environment otherwise.
+# src.utils._detect_gpu() uses only subprocess (rocminfo/nvidia-smi), safe here.
+from src.utils import is_rocm as _is_rocm
+
+if _is_rocm():
+    # HSA_OVERRIDE_GFX_VERSION — masks gfx1200 (RX 9060 XT) as 12.0.0 so that
+    #   MIOpen, HIP, and AOTriton compile correct kernels for the consumer ISA.
+    #   Without this, the runtime falls back to generic paths that mis-compile VAE
+    #   conv ops and trigger hipErrorLaunchFailure during decode.
+    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "12.0.0")
+    # MIOPEN_FIND_MODE=2 — skips exhaustive kernel benchmarking; uses the
+    #   pre-compiled heuristic DB instead. Benchmarking mode executes micro-kernels
+    #   that contain unresolved memory-indexing bugs on the narrow (wf32) wavefront.
+    os.environ.setdefault("MIOPEN_FIND_MODE", "2")
+    # FLASH_ATTENTION_TRITON_AMD_ENABLE — routes SDPA through AOTriton, generating
+    #   native wf32 instructions instead of the wf64-defaulting CDNA path.
+    os.environ.setdefault("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
+    os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+    # PYTORCH_HIP_ALLOC_CONF — expandable_segments is unsupported on ROCm and
+    #   causes the allocator to stall during large VAE decode allocations, which
+    #   manifests as hipErrorLaunchFailure in the conv upsampler. Hard-override
+    #   (not setdefault) so a stale ~/.bashrc value cannot sneak back in.
+    os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.8"
+    # Enable ROCm runtime and GEMM logging at moderate verbosity.
+    # ROCBLAS_LAYER=1 logs API call shapes only — value 2 triggers an exhaustive
+    # benchmark sweep of every solution per GEMM, causing minutes of pre-denoise stall.
+    os.environ.setdefault("ROCBLAS_LAYER", "1")
+    # MIOpen logs go to stderr; stderr is mirrored to project log files above.
+    os.environ.setdefault("MIOPEN_ENABLE_LOGGING", "1")
+    os.environ.setdefault("MIOPEN_LOG_LEVEL", "4")
+    # TORCH_LOGS="+inductor" prints inductor compilation decisions (fusion, tiling,
+    # vectorisation passes) to stderr.  Remove once you've seen enough.
+    os.environ.setdefault("TORCH_LOGS", "+inductor")
+    # ROCBLAS_USE_HIPBLASLT=0 was tested to force Tensile backend for the gfx1200
+    # VAE upsampler SIGABRT, but it broke dispatch for standard GEMM shapes in the
+    # CLIP text encoder (RuntimeError: Expected iter != ops_.end()).  Do not re-enable.
+# ───────────────────────────────────────────────────────────────────────────────
+from contextlib import asynccontextmanager
+import io, json, time, asyncio
 import zipfile
-from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.nodes.tiling_node import TilingInputs, TilingNode
 from src.nodes.upscale_node import UpscaleInputs, UpscaleNode
@@ -30,12 +113,14 @@ from diffusers import AutoPipelineForImage2Image
 from PIL import Image
 
 from src.pipeline import (
+    cleanup_resources,
     get_pipe,
     get_fast_pipe,
     warmup_pipeline,
     generate_image,
     shutdown,
     MODEL_CACHE_DIR,
+    log_runtime_diagnostics_once,
 )
 from src.loras import add_loras, record_lora_config, router as loras_router
 from src.prompt import process_prompt
@@ -57,6 +142,12 @@ async def lifespan(app: FastAPI):
     Shutdown: Flush TunableOp cache to disk and release VRAM.
     """
     # --- STARTUP ---
+    print(f"📝 Log directory: {_LOG_DIR}")
+    print(f"📝 Runtime stdout log: {_STDOUT_LOG_FILE}")
+    print(f"📝 Runtime stderr log: {_STDERR_LOG_FILE}")
+    print(f"📝 HIP log: {os.environ.get('AMD_LOG_LEVEL_FILE', '<unset>')}")
+    print(f"📝 rocBLAS log: {os.environ.get('ROCBLAS_LOG_PATH', '<unset>')}")
+    log_runtime_diagnostics_once()
 
     skip_warmup = os.environ.get("SKIP_PIPELINE_WARMUP", "0") == "1"
     if skip_warmup:
@@ -128,9 +219,16 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
     if request.reference:
         print("🖼️ Reference image provided, preparing for img2img generation...")
         init_image = Image.open(request.reference.file).convert("RGB")
-
+        print(
+            f"🖼️ Reference image loaded: size={init_image.size} mode={init_image.mode}"
+        )
         init_image = ImageOps.fit(init_image, (1024, 1024), method=Image.LANCZOS)
+        print(f"🖼️ Reference image resized to {init_image.size}")
+        print(
+            f"🔀 Converting pipe ({type(pipe).__name__}) → AutoPipelineForImage2Image..."
+        )
         pipe = AutoPipelineForImage2Image.from_pipe(pipe)
+        print(f"🔀 Converted to {type(pipe).__name__}")
 
     # 1. Initialize dynamic lists for Multi-ControlNet
     controlnets = []
@@ -349,24 +447,46 @@ def handle_generate_image(request: ImageRequest = Depends(ImageRequest.as_form))
         "pooled_prompt_embeds": pooled_prompt_embeds,
         "negative_prompt_embeds": negative_prompt_embeds,
         "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
-        "controlnet_conditioning_scale": control_scales if control_scales else None,
         "num_inference_steps": 8 if request.lightning else 30,
         "guidance_scale": 1.5 if request.lightning else 7.0,  # Fixed from 'cfg'
-        "height": target_height if "target_height" in locals() else 1024,
-        "width": target_width if "target_width" in locals() else 1024,
         "num_images_per_prompt": num_images,
-        "ip_adapter_image": ip_adapter_image if request.ip_adapter_image else None,
-        "control_guidance_end_step": 0.5,
         "seed": request.image_seed,
     }
+
+    # height/width are text2image-only; img2img derives dimensions from the input image.
+    # Inpaint (has_mask_in_divergent) uses tensor inputs that already carry dimensions.
+    if init_image is None and not has_mask_in_divergent:
+        gen_kwargs["height"] = target_height if "target_height" in locals() else 1024
+        gen_kwargs["width"] = target_width if "target_width" in locals() else 1024
+
+    if request.ip_adapter_image:
+        gen_kwargs["ip_adapter_image"] = ip_adapter_image
+
+    if controlnets:
+        gen_kwargs["controlnet_conditioning_scale"] = control_scales
+        gen_kwargs["control_guidance_end_step"] = 0.5
 
     if has_mask_in_divergent:
         gen_kwargs["image"] = reference_tensor
         gen_kwargs["mask_image"] = mask_tensor
         gen_kwargs["control_image"] = control_images if control_images else None
         gen_kwargs["strength"] = active_mask_strength
+    elif init_image is not None:
+        gen_kwargs["image"] = init_image
+        if request.strength is not None:
+            gen_kwargs["strength"] = request.strength
+        if control_images:
+            gen_kwargs["control_image"] = control_images
     else:
         gen_kwargs["image"] = control_images if control_images else None
+
+    loggable = {
+        k: (type(v).__name__ if hasattr(v, "__class__") else v)
+        for k, v in gen_kwargs.items()
+        if k != "pipe"
+    }
+    loggable["pipe_type"] = type(gen_kwargs["pipe"]).__name__
+    print(f"🚀 generate_image kwargs: {loggable}")
 
     images = generate_image(**gen_kwargs)
 

@@ -9,11 +9,20 @@ from diffusers import (
 )
 from pathlib import Path
 import os, gc, time
+import re
 import torch
+from src.utils import is_rocm, vram_gb, has_vram_gte
 
 _cached_pipe: StableDiffusionXLPipeline | None = None
 _cached_fast_pipe: StableDiffusionXLPipeline | None = None
 _cached_model_name: str | None = None
+_cached_cpu_vae: AutoencoderKL | None = None
+_cpu_vae_dtype: torch.dtype = (
+    torch.float32
+)  # upgraded to bf16 at first load if CPU supports it
+_cleanup_hooks: list = (
+    []
+)  # callbacks registered by other modules (e.g. outpainting_node)
 DTYPE = torch.float16
 VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
 CWD = Path(os.getcwd())
@@ -21,6 +30,7 @@ MODEL_CACHE_DIR = CWD / "caches" / "models"
 WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
 MODELS_DIR = Path.home() / "sd_models"
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
+_runtime_diag_logged = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 # pip nvidia-cudnn-cu12 conflicts with the system CUDA 12.8 driver — any call into
@@ -30,11 +40,21 @@ torch.backends.cudnn.enabled = False
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+def register_cleanup_hook(fn) -> None:
+    """Register a zero-argument callable to be invoked by cleanup_resources().
+
+    Use this to clear module-level caches in other modules that share VRAM
+    with the base pipeline (e.g. ControlNet pipe cache in outpainting_node).
+    Avoids circular imports: callers import from src.pipeline, not the reverse.
+    """
+    _cleanup_hooks.append(fn)
+
+
 def cleanup_resources():
     """
     Forcefully releases VRAM. Critical for avoiding Linux 6.14 GTT Swap crashes.
     """
-    global _cached_pipe, _cached_fast_pipe
+    global _cached_pipe, _cached_fast_pipe, _cached_cpu_vae
 
     # Unload IP-Adapter first (holds extra GPU tensors outside the main model)
     for pipe in (_cached_pipe, _cached_fast_pipe):
@@ -53,10 +73,98 @@ def cleanup_resources():
         del _cached_fast_pipe
         _cached_fast_pipe = None
 
+    if _cached_cpu_vae is not None:
+        del _cached_cpu_vae
+        _cached_cpu_vae = None
+
+    # Drop other module caches BEFORE GC so shared CUDA tensors (e.g. UNet/VAE
+    # still referenced by _cn_pipe_cache after _cached_pipe is deleted) have
+    # their refcount reach zero before gc.collect() + empty_cache() run.
+    for hook in _cleanup_hooks:
+        try:
+            hook()
+        except Exception:
+            pass
+
     # Force Python GC and ROCm cache clear
     gc.collect()
-    torch.cuda.empty_cache()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        # HIP context may already be dead after a kernel crash — ignore
+        pass
+
     print("🧹 VRAM resources released.")
+
+
+def log_runtime_diagnostics_once():
+    """Log one-time runtime info that explains long pre-step stalls."""
+    global _runtime_diag_logged
+    if _runtime_diag_logged:
+        return
+
+    print("🧪 Runtime diagnostics:")
+    print(
+        f"   torch={torch.__version__} cuda={torch.version.cuda} hip={torch.version.hip}"
+    )
+    print(f"   is_rocm={is_rocm()} vram_gb={vram_gb():.1f}")
+    print(
+        "   env HSA_OVERRIDE_GFX_VERSION="
+        f"{os.environ.get('HSA_OVERRIDE_GFX_VERSION', '<unset>')}"
+    )
+    print(f"   env MIOPEN_FIND_MODE={os.environ.get('MIOPEN_FIND_MODE', '<unset>')}")
+    print(
+        "   env PYTORCH_HIP_ALLOC_CONF="
+        f"{os.environ.get('PYTORCH_HIP_ALLOC_CONF', '<unset>')}"
+    )
+    print(
+        "   env TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL="
+        f"{os.environ.get('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL', '<unset>')}"
+    )
+    _runtime_diag_logged = True
+
+
+def attach_inference_timing(pipe_kwargs: dict, label: str) -> tuple[dict, float]:
+    """
+    Attach per-request denoise-step timing logs to a diffusers call.
+    """
+    t0 = time.monotonic()
+    steps = int(pipe_kwargs.get("num_inference_steps") or 0)
+    print(f"⏱️  {label}: dispatching pipeline call (steps={steps})")
+
+    if "callback_on_step_end" in pipe_kwargs:
+        print(f"⏱️  {label}: callback already provided; pre-step timing unavailable.")
+        return pipe_kwargs, t0
+
+    first_step_logged = False
+
+    def on_step_end(_pipe, step_index, _timestep, callback_kwargs):
+        nonlocal first_step_logged
+        peak = torch.cuda.max_memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        torch.cuda.reset_peak_memory_stats()
+        step_str = f"step={step_index + 1}/{max(steps, 1)}"
+        if not first_step_logged:
+            elapsed = time.monotonic() - t0
+            print(
+                f"⏱️  {label}: first denoise step reached in {elapsed:.2f}s "
+                f"({step_str}) | GPU peak={peak:.2f} GB reserved={reserved:.2f} GB"
+            )
+            first_step_logged = True
+        else:
+            print(
+                f"⏱️  {label}: {step_str} | GPU peak={peak:.2f} GB reserved={reserved:.2f} GB"
+            )
+        return callback_kwargs
+
+    pipe_kwargs["callback_on_step_end"] = on_step_end
+    pipe_kwargs["callback_on_step_end_tensor_inputs"] = []
+    return pipe_kwargs, t0
+
+
+def finalize_inference_timing(label: str, t0: float):
+    elapsed = time.monotonic() - t0
+    print(f"⏱️  {label}: pipeline call finished in {elapsed:.2f}s")
 
 
 def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
@@ -68,7 +176,7 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
     cached_dir = MODEL_CACHE_DIR / model
 
     # FAST PATH: diffusers cache exists (VAE is already madebyollin/sdxl-vae-fp16-fix,
-    # baked in when the cache was saved — no need to reload it from HF hub)
+    # baked in when the cache was saved — no need to reload it from HF hub).
     if (cached_dir / "model_index.json").is_file():
         print(f"⚡ Loading from diffusers cache: {cached_dir}")
         t0 = time.monotonic()
@@ -140,44 +248,30 @@ def get_pipe(model: str = "juggernaut"):
     # FlashAttention 2 is used automatically via PyTorch SDPA (AttnProcessor2_0)
     print("🔥 Pipeline Ready. Using FlashAttention 2 (via PyTorch SDPA).")
 
-    # 6. MEMORY PRESSURE MITIGATIONS (configured before GPU placement)
-    # Base the decision on total VRAM capacity — memory_allocated() is unreliable on ROCm
-    # immediately after model load. SDXL weights consume ~10 GB, so on GPUs ≤ 24 GB
-    # memory management is required. Attention slicing must never be used on ROCm because
-    # torch.baddbmm triggers an illegal memory access in SlicedAttnProcessor.
-    from src.utils import vram_gb, is_rocm
+    # 6. MEMORY PRESSURE MITIGATIONS
+    # On ROCm: attention slicing must never be used — torch.baddbmm triggers an illegal
+    # memory access in SlicedAttnProcessor. enable_model_cpu_offload() was tried but
+    # its accelerate hooks corrupt the GPU context for the VAE conv upsampler.
+    # VAE tiling and slicing are re-enabled: they are not confirmed causes of the hangs.
+    # On CUDA with sufficient VRAM these concerns don't apply.
+    if is_rocm() and not has_vram_gte(24.0):
+        print(
+            f"⚠️  ROCm GPU has {vram_gb():.1f} GB VRAM — enabling VAE tiling and slicing."
+        )
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
+        # Raise tile thresholds so a standard 1024x1024 canvas (128x128 latent)
+        # is decoded as a single pass. Default tile_latent_min_size=64 (derived
+        # from sample_size=512, 4 down-blocks) causes the 128x128 latent to be
+        # split into 64x64 chunks, introducing linear-blend seam artifacts that
+        # are especially visible at the inpainting void boundary. Tiling only
+        # activates when the latent strictly exceeds the threshold, so setting
+        # tile_latent_min_size=128 reserves partitioning for outputs >1024x1024.
+        pipe.vae.tile_sample_min_size = 1024
+        pipe.vae.tile_latent_min_size = 128
 
-    use_cpu_offload = is_rocm() and vram_gb() < 24.0
-
-    if vram_gb() < 24.0:
-        if use_cpu_offload:
-            # enable_model_cpu_offload offloads UNet to CPU before VAE runs, so the VAE
-            # has the full VRAM budget. VAE tiling conflicts with accelerate's GPU hooks
-            # and causes a ROCm kernel hang — disable it; VRAM headroom is sufficient.
-            print(
-                f"⚠️  GPU has {vram_gb():.1f} GB VRAM — enabling VAE slicing (tiling disabled; CPU offload handles headroom)."
-            )
-            pipe.vae.disable_tiling()
-            pipe.vae.enable_slicing()
-        else:
-            print(
-                f"⚠️  GPU has {vram_gb():.1f} GB VRAM — enabling VAE tiling and slicing."
-            )
-            pipe.vae.enable_tiling()
-            pipe.vae.enable_slicing()
-    else:
-        pipe.vae.disable_tiling()
-        pipe.vae.disable_slicing()
-
-    # 7. TRANSFER TO GPU
-    # On ROCm with limited VRAM, use enable_model_cpu_offload(): each sub-model
-    # (text_encoders → unet → vae) is loaded to GPU just-in-time and offloaded after use.
-    # On NVIDIA or ≥ 24 GB GPU, keep everything resident on the GPU for speed.
-    if use_cpu_offload:
-        print("🔀 ROCm + limited VRAM → using model CPU offload.")
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to("cuda")
+    # 7. TRANSFER TO GPU — keep all sub-models resident; no accelerate offload hooks.
+    pipe.to("cuda")
 
     _cached_pipe = pipe
     _cached_model_name = model
@@ -191,22 +285,35 @@ def warmup_pipeline(
     width: int = 1024,
     height: int = 1024,
 ):
-    def run_warmup():
-        # Run a single UNet forward pass to warm up MIOpen/TunableOp kernels.
-        # output_type="latent" skips VAE decode — VAE slicing + accelerate CPU offload
-        # hooks cause a ROCm kernel hang (same class of issue as tiling; see get_pipe).
+    def run_warmup(run_width: int, run_height: int):
+        # Warm UNet kernels, then exercise the decode path used at runtime.
         generator = torch.Generator("cuda").manual_seed(42)
         with torch.no_grad():
-            pipe(
+            latents = pipe(
                 prompt="warmup",
                 negative_prompt="",
                 num_inference_steps=1,
                 guidance_scale=1.0,
-                width=width,
-                height=height,
+                width=run_width,
+                height=run_height,
                 generator=generator,
                 output_type="latent",
-            )
+            ).images
+
+        if is_rocm():
+            # When ROCBLAS_USE_HIPBLASLT=0, rocBLAS routes through Tensile which may
+            # have the gfx1200 VAE upsampler kernel.  Test GPU decode; SIGABRT here
+            # means Tensile also lacks the kernel — remove the env var to revert.
+            if os.environ.get("ROCBLAS_USE_HIPBLASLT") == "0":
+                decode_latents_safe(pipe, latents)
+            else:
+                # gfx1200 (RDNA4) crashes with SIGABRT on GPU VAE decode — always use CPU.
+                decode_latents_on_cpu(pipe, latents)
+            return
+
+        scaling = float(getattr(pipe.vae.config, "scaling_factor", 0.18215))
+        with torch.no_grad():
+            pipe.vae.decode(latents / scaling, return_dict=False)[0]
 
     def load_warmup() -> set[str]:
         """Load the set of previously warmed config keys from disk."""
@@ -240,11 +347,50 @@ def warmup_pipeline(
         print(f"💾 Recorded new warmed config: {key}")
 
     model = _cached_model_name or "juggernaut"
-    print(f"🔥 Warming up base pipeline ({width}x{height}, 1 step)...")
+    warmup_key = f"{model}_{width}x{height}_1step_decode"
+    legacy_key = f"{model}_{width}x{height}_1step"
+    warmed = load_warmup()
+
+    run_width = width
+    run_height = height
+    selected_key = warmup_key
+
+    if warmup_key in warmed or legacy_key in warmed:
+        print(f"⚡ Warmup cache hit: {warmup_key} (running with cached config)")
+    else:
+        # No exact match: use a cached config for this model if available.
+        candidates: list[tuple[int, int, str]] = []
+        for key in warmed:
+            m = re.match(
+                r"^(?P<model>.+)_(?P<w>\d+)x(?P<h>\d+)_1step(?:_decode)?$", key
+            )
+            if not m:
+                continue
+            if m.group("model") != model:
+                continue
+            w = int(m.group("w"))
+            h = int(m.group("h"))
+            candidates.append((w, h, key))
+
+        if candidates:
+            # Prefer the lightest cached size to keep startup fast.
+            run_width, run_height, selected_key = min(
+                candidates, key=lambda x: x[0] * x[1]
+            )
+            print(
+                "⚡ Using nearest cached warmup config "
+                f"{selected_key} instead of {warmup_key}."
+            )
+
+    print(
+        "🔥 Warming up base pipeline "
+        f"({run_width}x{run_height}, 1 step + VAE decode)..."
+    )
     t0 = time.monotonic()
-    run_warmup()
+    run_warmup(run_width, run_height)
     print(f"   Warmed in {time.monotonic() - t0:.1f}s")
-    save_warmup(f"{model}_{width}x{height}_1step")
+    if run_width == width and run_height == height:
+        save_warmup(warmup_key)
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -265,7 +411,204 @@ def generate_image(pipe, **kwargs):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     kwargs["generator"] = generator
 
-    return pipe(**kwargs).images
+    # On ROCm, get latents first so we can measure VRAM at the peak of denoising,
+    # then attempt GPU decode (VAE tiling keeps GEMM sizes small enough to avoid the
+    # gfx1200 upsampler crash).  Fall back to CPU decode if anything goes wrong.
+    force_latent = is_rocm() and kwargs.get("output_type", "pil") == "pil"
+    if force_latent:
+        kwargs["output_type"] = "latent"
+
+    kwargs, t0 = attach_inference_timing(kwargs, label="generate_image")
+    print(
+        f"⏱️  generate_image: calling pipe ({type(pipe).__name__}) with keys: {[k for k in kwargs if k != 'callback_on_step_end']}"
+    )
+
+    # On ROCm the VAE encoder has the same gfx1200 kernel hang as the decoder.
+    # Pre-encode the input image on CPU and pass latents directly so the pipeline
+    # skips its internal vae.encode call entirely.
+    is_img2img = "image" in kwargs and isinstance(
+        kwargs["image"], __import__("PIL").Image.Image
+    )
+    if is_rocm() and is_img2img:
+        kwargs["image"] = encode_image_safe(pipe, kwargs["image"])
+
+    output = pipe(**kwargs).images
+
+    print(f"⏱️  generate_image: pipe() returned, output type={type(output).__name__}")
+    finalize_inference_timing("generate_image", t0)
+
+    if force_latent and isinstance(output, torch.Tensor):
+        vram_alloc = torch.cuda.memory_allocated()
+        vram_reserved = torch.cuda.memory_reserved()
+        vram_total = torch.cuda.get_device_properties(0).total_memory
+        print(
+            f"📊 VRAM at decode: allocated={vram_alloc/1024**3:.2f} GB  "
+            f"reserved={vram_reserved/1024**3:.2f} GB  "
+            f"total={vram_total/1024**3:.2f} GB  "
+            f"free={(vram_total - vram_reserved)/1024**3:.2f} GB"
+        )
+        t_decode = time.monotonic()
+        output = decode_latents_safe(pipe, output)
+        print(f"⏱️  VAE decode finished in {time.monotonic() - t_decode:.2f}s")
+
+    return output
+
+
+def _probe_cpu_bf16() -> bool:
+    """
+    Probe whether this CPU + PyTorch build supports bf16 arithmetic.
+    torch.backends.cpu.is_bf16_supported() mis-detects on some ROCm builds,
+    so we do a live conv2d in bf16 and treat any exception as no-support.
+    """
+    try:
+        x = torch.zeros(1, 1, 4, 4, dtype=torch.bfloat16)
+        w = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+        torch.nn.functional.conv2d(x, w)
+        return True
+    except Exception:
+        return False
+
+
+def get_cpu_vae() -> AutoencoderKL:
+    """Lazily load and compile a CPU VAE for ROCm-safe latent decoding."""
+    global _cached_cpu_vae, _cpu_vae_dtype
+    if _cached_cpu_vae is None:
+        # is_bf16_supported() mis-detects on some ROCm builds; use a live probe instead.
+        api_result = None
+        try:
+            api_result = torch.backends.cpu.is_bf16_supported()
+        except Exception:
+            pass
+        probe_result = _probe_cpu_bf16()
+        use_bf16 = probe_result
+        print(
+            f"   bf16 probe: api={api_result} live={probe_result} → using bf16={use_bf16}"
+        )
+        _cpu_vae_dtype = torch.bfloat16 if use_bf16 else torch.float32
+        print(f"📦 Loading CPU VAE ({_cpu_vae_dtype}): {VAE_ID}")
+        vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=_cpu_vae_dtype)
+        vae.to("cpu").eval()
+        # channels_last (NHWC) layout lets the CPU AVX-512 conv2d path run ~2x faster
+        # than the default NCHW layout.  Must happen before torch.compile so inductor
+        # generates NHWC-aware kernels.
+        vae.to(memory_format=torch.channels_last)
+        # mode="default" does SIMD vectorisation + loop fusion on CPU.
+        # reduce-overhead is CUDA-specific and actively hurts CPU throughput.
+        # fullgraph=True ensures inductor sees the whole decoder graph with no breaks.
+        t_compile = time.monotonic()
+        try:
+            _cached_cpu_vae = torch.compile(
+                vae, backend="inductor", mode="default", fullgraph=True
+            )
+            print(
+                f"   torch.compile prepared in {time.monotonic() - t_compile:.2f}s "
+                f"(JIT compilation happens on first decode call)"
+            )
+        except Exception as exc:
+            print(f"   torch.compile unavailable ({exc}), running eager.")
+            _cached_cpu_vae = vae
+    return _cached_cpu_vae
+
+
+def decode_latents_on_gpu(pipe, latents: torch.Tensor) -> list:
+    """Attempt GPU VAE decode (fast path). Only safe when Tensile kernels cover the
+    VAE upsampler GEMM shapes — requires ROCBLAS_USE_HIPBLASLT=0 on gfx1200."""
+    scaling = float(getattr(pipe.vae.config, "scaling_factor", 0.18215))
+    t_gpu = time.monotonic()
+    from PIL import Image
+
+    with torch.inference_mode():
+        decoded = pipe.vae.decode(latents / scaling, return_dict=False)[0]
+    decoded = (decoded.float() / 2 + 0.5).clamp(0, 1)
+    images = [
+        Image.fromarray(
+            img.mul(255).round().byte().permute(1, 2, 0).cpu().numpy(), mode="RGB"
+        )
+        for img in decoded
+    ]
+    print(f"⏱️  GPU VAE decode: {time.monotonic() - t_gpu:.2f}s")
+    return images
+
+
+def encode_image_safe(pipe, image) -> torch.Tensor:
+    """
+    Encode a PIL image to latents on CPU to avoid the gfx1200 VAE encoder hang.
+    Returns a latent tensor on CUDA ready to pass as `image` to img2img pipelines.
+    """
+    import torchvision.transforms.functional as TF
+
+    cpu_vae = get_cpu_vae()
+    scaling = float(getattr(pipe.vae.config, "scaling_factor", 0.18215))
+
+    t_enc = time.monotonic()
+    print("📦 CPU VAE encode: encoding input image to latents...")
+    with torch.inference_mode():
+        img_tensor = (
+            TF.to_tensor(image)
+            .unsqueeze(0)
+            .to("cpu", dtype=_cpu_vae_dtype)
+            .to(memory_format=torch.channels_last)
+        )
+        # VAE expects [-1, 1]
+        img_tensor = img_tensor * 2.0 - 1.0
+        latents = cpu_vae.encode(img_tensor, return_dict=False)[0].mean * scaling
+    latents = latents.to("cuda", dtype=torch.float16)
+    print(
+        f"⏱️  CPU VAE encode finished in {time.monotonic() - t_enc:.2f}s  shape={tuple(latents.shape)}"
+    )
+    return latents
+
+
+def decode_latents_safe(pipe, latents: torch.Tensor):
+    """
+    Decode latent tensors to PIL images.
+    On ROCm with ROCBLAS_USE_HIPBLASLT=0, attempts GPU decode (Tensile backend).
+    Falls back to CPU decode otherwise — gfx1200 hipBLASLT path causes SIGABRT.
+    """
+    if is_rocm() and os.environ.get("ROCBLAS_USE_HIPBLASLT") == "0":
+        return decode_latents_on_gpu(pipe, latents)
+    return decode_latents_on_cpu(pipe, latents)
+
+
+def decode_latents_on_cpu(pipe, latents: torch.Tensor):
+    """
+    Decode latent tensors to PIL images on CPU.
+    """
+    if not isinstance(latents, torch.Tensor):
+        return latents
+
+    cpu_vae = get_cpu_vae()
+    scaling = float(getattr(pipe.vae.config, "scaling_factor", 0.18215))
+
+    from PIL import Image
+
+    _is_first_decode = not hasattr(decode_latents_on_cpu, "_compiled_and_warmed")
+    if _is_first_decode:
+        print("🔨 First CPU VAE decode — torch.compile JIT compilation starting...")
+    t_cpu = time.monotonic()
+    with torch.inference_mode():
+        latents_cpu = (
+            latents.detach()
+            .to("cpu", dtype=_cpu_vae_dtype)
+            .to(memory_format=torch.channels_last)
+        ) / scaling
+        decoded_batch = cpu_vae.decode(latents_cpu, return_dict=False)[0]
+        # bf16 tensors can't be converted to numpy directly — cast to fp32 first.
+        decoded_batch = (decoded_batch.float() / 2 + 0.5).clamp(0, 1)
+        images = [
+            Image.fromarray(
+                img.mul(255).round().byte().permute(1, 2, 0).numpy(), mode="RGB"
+            )
+            for img in decoded_batch
+        ]
+    elapsed = time.monotonic() - t_cpu
+    if _is_first_decode:
+        decode_latents_on_cpu._compiled_and_warmed = True
+        print(f"⏱️  CPU VAE decode (first, includes JIT compile): {elapsed:.2f}s")
+    else:
+        print(f"⏱️  CPU VAE decode: {elapsed:.2f}s")
+
+    return images
 
 
 def shutdown():

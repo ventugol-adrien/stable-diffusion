@@ -19,6 +19,27 @@ class HostConfig(BaseModel):
 
 
 def _detect_gpu() -> GPUConfig:
+    import sys
+
+    # Fast path: if torch is already in sys.modules, query the hardware directly.
+    # This is more reliable than subprocess and avoids spawning child processes.
+    # When called before torch is imported (e.g. from main.py before env vars are
+    # set) torch won't be present yet, so we fall through to the subprocess path.
+    if "torch" in sys.modules:
+        torch = sys.modules["torch"]
+        try:
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0)
+                props = torch.cuda.get_device_properties(0)
+                vram = round(props.total_memory / (1024**3), 2)
+                plat: Literal["cuda", "rocm"] = (
+                    "rocm" if torch.version.hip is not None else "cuda"
+                )
+                return GPUConfig(platform=plat, name=name, vram_gb=vram)
+        except Exception:
+            pass
+
+    # Slow path: subprocess detection when torch isn't loaded yet.
     # NVIDIA
     try:
         result = subprocess.run(

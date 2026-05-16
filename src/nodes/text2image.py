@@ -3,8 +3,14 @@ import torch
 import numpy as np
 from pydantic import Field, ConfigDict
 from PIL import Image
-from src.pipeline import get_pipe
+from src.pipeline import (
+    get_pipe,
+    decode_latents_safe,
+    attach_inference_timing,
+    finalize_inference_timing,
+)
 from src.nodes.base_node import BaseNode, BaseNodeModel
+from src.utils import is_rocm
 
 
 class Text2ImageInputs(BaseNodeModel):
@@ -30,13 +36,14 @@ class Text2ImageNode(BaseNode):
         self.embeds = None
 
     def __call__(self, *args, **kwargs) -> dict[str, list[Image.Image]]:
+        force_latent = is_rocm() and self.params.output_type == "pil"
         pipe_kwargs = {
             "width": self.params.width,
             "height": self.params.height,
             "num_inference_steps": self.params.steps,
             "guidance_scale": self.params.cfg_scale,
             "num_images_per_prompt": self.params.num_images_per_prompt,
-            "output_type": self.params.output_type,
+            "output_type": "latent" if force_latent else self.params.output_type,
         }
         if self.embeds is not None:
             pipe_kwargs.update(self.embeds)
@@ -44,7 +51,11 @@ class Text2ImageNode(BaseNode):
         pipe = get_pipe(self.params.model)
         print(pipe.__class__.__name__)
         print(pipe.scheduler.__class__.__name__)
+        pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="text2image")
         output = pipe(**pipe_kwargs).images
+        finalize_inference_timing("text2image", t0)
+        if force_latent and isinstance(output, torch.Tensor):
+            output = decode_latents_safe(pipe, output)
         if isinstance(output, torch.Tensor):
             output = [
                 Image.fromarray(
