@@ -84,23 +84,27 @@ if _is_rocm():
     # VAE upsampler SIGABRT, but it broke dispatch for standard GEMM shapes in the
     # CLIP text encoder (RuntimeError: Expected iter != ops_.end()).  Do not re-enable.
 # ───────────────────────────────────────────────────────────────────────────────
+
+import base64
 from contextlib import asynccontextmanager
 import io, json, time, asyncio
+from random import randint
 import zipfile
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import Response, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.nodes.tiling_node import TilingInputs, TilingNode
 from src.nodes.upscale_node import UpscaleInputs, UpscaleNode
 from src.nodes.hi_res_node import HiResInputs, HiResNode
 from src.nodes.transform_node import TransformInputs, TransformNode
+from src.nodes.outpainting_node import OutpaintingInputs, OutpaintingNode
 from src.nodes.image2image import Image2ImageNode, Image2ImageInputs
 from src.nodes.response_node import ResponseNode
 from src.nodes.text2image import Text2ImageNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
 from src.nodes.compel_node import CompelNode, CompelInputs
-from src.models import DAGForm, ImageRequest
+from src.models import DAGForm, ImageRequest, OutpaintRequest
 from compel import CompelForSDXL
 from diffusers import (
     AutoPipelineForImage2Image,
@@ -656,6 +660,47 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
     hires_images = hires_node(tiling_outputs=tiling_plan)
     final_images = transform_node(**hires_images)
     return response_node(**final_images)
+
+
+@app.post("/workflows/outpaint")
+async def execute_outpaint_workflow(
+    request: OutpaintRequest = Depends(OutpaintRequest.as_form), stream=False
+):
+    cleanup_resources()
+    compel_node = CompelNode(
+        CompelInputs(
+            prompt=request.user_input,
+            negative_prompt=request.negative_input,
+            model=request.model,
+        )
+    )
+    transform_node = TransformNode(
+        TransformInputs(
+            z=request.transform_z or 1.0,
+            dx=request.transform_dx or 0,
+            dy=request.transform_dy or 0,
+            r=request.transform_r or 0.0,
+        )
+    )
+    outpaint_node = OutpaintingNode(
+        OutpaintingInputs(
+            model=request.model,
+            steps=request.steps,
+            strength=request.strength if request.strength is not None else 1.0,
+        )
+    )
+    # Aggressively free VRAM before outpainting, which is memory-hungry
+    response_node = ResponseNode()
+    embeds = compel_node()
+    transformed = transform_node(
+        images=[Image.open(request.reference.file).convert("RGB")]
+    )
+    outpainted = outpaint_node(
+        images=transformed["images"],
+        masks=transformed.get("masks"),
+        **embeds,
+    )
+    return response_node(**outpainted)
 
 
 @app.post("/workflows/image/")

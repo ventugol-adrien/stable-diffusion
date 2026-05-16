@@ -152,6 +152,58 @@ class DivergentSpace(BaseModel):
     transform_strength: float = None
 
 
+class OutpaintRequest(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
+    steps: int = Field(50, ge=1, le=150)
+    user_input: str
+    negative_input: str = ""
+    model: str = os.environ.get("DEFAULT_MODEL", "juggernaut")
+    strength: float = None
+    reference: UploadFile = None
+    ip_adapter_scale: float = Field(default=None, alias="ip_scale")
+    ip_adapter_image: UploadFile = Field(default=None, alias="ip_image")
+    lightning: bool = False
+    image_seed: int = -1
+    batch_size: int = 1
+    transform_dx: int = None
+    transform_dy: int = None
+    transform_z: float = None
+    transform_r: float = None
+
+    @classmethod
+    async def as_form(cls, request: Request) -> "ImageRequest":
+        form_data = await request.form()
+        data = {}
+
+        for key, value in form_data.multi_items():
+            if value == "":
+                continue
+
+            if key in ["user_input", "negative_input", "model"]:
+                data[key] = value
+            elif key in ["strength", "ip_scale"]:
+                data[key] = float(value)
+            elif key in ["lightning"]:
+                data[key] = value.lower() == "true"
+            elif key in ["image_seed", "batch_size", "steps"]:
+                data[key] = int(value)
+            elif key in [
+                "reference",
+                "ip_adapter_image",
+            ]:
+                data[key] = value
+            elif key in [
+                "transform_dx",
+                "transform_dy",
+                "transform_z",
+                "transform_r",
+                "transform_strength",
+            ]:
+                data[key] = float(value) if "." in value else int(value)
+
+        return cls.model_validate(data)
+
+
 class ImageRequest(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
 
