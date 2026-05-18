@@ -719,3 +719,9 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
     else:
         images = image_node(**embeds)
     return response_node(**images)
+
+
+@app.post("/cleanup")
+def cleanup():
+    cleanup_resources()
+    return {"status": "success"}

@@ -1,9 +1,5 @@
-import io
-import os
-import base64
-import json
+import io, os, base64, json, httpx
 from typing import Literal
-import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Request, UploadFile, File
 from PIL import Image
@@ -174,7 +170,6 @@ class OutpaintRequest(BaseModel):
     async def as_form(cls, request: Request) -> "ImageRequest":
         form_data = await request.form()
         data = {}
-
         for key, value in form_data.multi_items():
             if value == "":
                 continue
