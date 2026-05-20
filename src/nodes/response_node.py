@@ -7,6 +7,8 @@ from fastapi.responses import Response
 from PIL import Image
 from pydantic import Field, ConfigDict
 
+from src.classes import PNGStreamingResponse, ZipStreamingResponse
+from src.utils import stream_image, stream_zip
 from src.nodes.base_node import BaseNode, BaseNodeModel
 
 
@@ -15,6 +17,7 @@ class ResponseInputs(BaseNodeModel):
         "image/png", description="Media type for single-image response"
     )
     filename: str = Field("image", description="Base filename (without extension)")
+    stream: bool = Field(False, description="Whether to stream the response")
     model_config = ConfigDict(extra="allow")
 
 
@@ -50,6 +53,43 @@ class ResponseNode(BaseNode):
                 )
         images = [self._to_pil(img) for img in images]
         print(f"[ResponseNode] after _to_pil: {[type(img).__name__ for img in images]}")
+        if self.params.stream:
+            if len(images) == 1:
+                image: Image.Image = images[0]
+                print("Streaming response...")
+                return PNGStreamingResponse(
+                    stream_image(image),
+                    headers={
+                        "Content-Disposition": f"inline; filename={self.params.filename}.png",
+                        **(
+                            {
+                                "X-Metrics-Latency": str(data["latency"]),
+                                "X-Metrics-Throughput": str(data["throughput"]),
+                                "X-Metrics-Breakdown": json.dumps(data["breakdown"]),
+                            }
+                            if "latency" in data
+                            else {}
+                        ),
+                    },
+                )
+            else:
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    if data:
+                        zip_file.writestr("metrics.json", json.dumps(data))
+                    for i, img in enumerate(images):
+                        img_buffer = io.BytesIO()
+                        img.save(img_buffer, format="PNG")
+                        zip_file.writestr(
+                            f"{self.params.filename}_{i}.png", img_buffer.getvalue()
+                        )
+                print("Streaming ZIP response...")
+                return ZipStreamingResponse(
+                    stream_zip(zip_buffer),
+                    headers={
+                        "Content-Disposition": f"attachment; filename={self.params.filename}.zip",
+                    },
+                )
         if len(images) == 1:
             buf = io.BytesIO()
             images[0].save(buf, format="PNG")

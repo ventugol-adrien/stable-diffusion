@@ -53,7 +53,7 @@ class CompelNode(BaseNode):
 
     def __call__(self, *args, **kwargs):
         super().__call__(*args, **kwargs)
-        pipe = get_pipe()
+        pipe = get_pipe(self.params.model)
         positive_prompt, negative_prompt = process_prompt(
             self.params.prompt, self.params.negative_prompt, self.params.model
         )

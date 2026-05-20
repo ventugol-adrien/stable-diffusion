@@ -1,7 +1,21 @@
 import os
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
+
+# Load .env before anything else so all subsequent os.getenv() calls see the vars.
+_env_file = Path(__file__).resolve().parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+# Captured before uvicorn mutates argv — used by /cleanup to execve-restart.
+_ORIG_ARGV = sys.argv[:]
+from src.llama import pause_llm
 from src.classes import PNGStreamingResponse, ZipStreamingResponse
 from typing import AsyncIterable
 
@@ -49,7 +63,12 @@ os.environ.setdefault("ROCBLAS_LOG_PATH", str(_LOG_DIR / f"rocblas_{_RUN_ID}.log
 # Must be set BEFORE torch or diffusers are imported; uvicorn does not source
 # ~/.bashrc so these would be absent from the process environment otherwise.
 # src.utils._detect_gpu() uses only subprocess (rocminfo/nvidia-smi), safe here.
-from src.utils import is_rocm as _is_rocm
+from src.utils import (
+    is_rocm as _is_rocm,
+    is_vram_pressure_high,
+    stream_image,
+    stream_zip,
+)
 
 if _is_rocm():
     # HSA_OVERRIDE_GFX_VERSION — masks gfx1200 (RX 9060 XT) as 12.0.0 so that
@@ -99,12 +118,12 @@ from src.nodes.hi_res_node import HiResInputs, HiResNode
 from src.nodes.transform_node import TransformInputs, TransformNode
 from src.nodes.outpainting_node import OutpaintingInputs, OutpaintingNode
 from src.nodes.image2image import Image2ImageNode, Image2ImageInputs
-from src.nodes.response_node import ResponseNode
+from src.nodes.response_node import ResponseInputs, ResponseNode
 from src.nodes.text2image import Text2ImageNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
 from src.nodes.compel_node import CompelNode, CompelInputs
-from src.models import DAGForm, ImageRequest, OutpaintRequest
+from src.models import DAGForm, Image2ImageRequest, ImageRequest, OutpaintRequest
 from compel import CompelForSDXL
 from diffusers import (
     AutoPipelineForImage2Image,
@@ -147,6 +166,7 @@ async def lifespan(app: FastAPI):
     Shutdown: Flush TunableOp cache to disk and release VRAM.
     """
     # --- STARTUP ---
+
     print(f"📝 Log directory: {_LOG_DIR}")
     print(f"📝 Runtime stdout log: {_STDOUT_LOG_FILE}")
     print(f"📝 Runtime stderr log: {_STDERR_LOG_FILE}")
@@ -183,7 +203,7 @@ origins = json.loads(os.environ.get("ORIGINS", "[]"))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # Allows specific origins (use ["*"] to allow all)
+    allow_origins=["*"],  # Allows specific origins (use ["*"] to allow all)
     allow_credentials=True,
     allow_methods=["*"],  # Allows all HTTP methods (GET, POST, etc.)
     allow_headers=["*"],  # Allows all headers
@@ -192,50 +212,6 @@ app.add_middleware(
 app.include_router(depthmap_router)
 app.include_router(loras_router)
 app.include_router(host_router)
-
-
-async def stream_image(
-    image: Image.Image, chunk_size: int = 1024
-) -> AsyncIterable[bytes]:
-    buffer = io.BytesIO()
-    await asyncio.to_thread(image.save, buffer, format="PNG", interlace=True)
-    total_size = buffer.getbuffer().nbytes
-    buffer.seek(0)
-    bytes_sent = 0
-    while chunk := buffer.read(chunk_size):
-        bytes_sent += len(chunk)
-        percent = (bytes_sent / total_size) * 100
-        bar_length = 30
-        filled_len = int(bar_length * percent // 100)
-        bar = "█" * filled_len + "-" * (bar_length - filled_len)
-        sys.stdout.write(
-            f"\rStreaming: [{bar}] {percent:.1f}% ({bytes_sent}/{total_size} bytes)"
-        )
-        sys.stdout.flush()
-        yield chunk
-        await asyncio.sleep(0)  # Yield control to the event loop for responsiveness
-    print("\nStreaming complete.")
-
-
-async def stream_zip(
-    zip_buffer: io.BytesIO, chunk_size: int = 1024
-) -> AsyncIterable[bytes]:
-    total_size = zip_buffer.getbuffer().nbytes
-    zip_buffer.seek(0)
-    bytes_sent = 0
-    while chunk := zip_buffer.read(chunk_size):
-        bytes_sent += len(chunk)
-        percent = (bytes_sent / total_size) * 100
-        bar_length = 30
-        filled_len = int(bar_length * percent // 100)
-        bar = "█" * filled_len + "-" * (bar_length - filled_len)
-        sys.stdout.write(
-            f"\rStreaming ZIP: [{bar}] {percent:.1f}% ({bytes_sent}/{total_size} bytes)"
-        )
-        sys.stdout.flush()
-        yield chunk
-        await asyncio.sleep(0)  # Yield control to the event loop for responsiveness
-    print("\nStreaming ZIP complete.")
 
 
 @app.post("/generate/image")
@@ -667,6 +643,9 @@ async def execute_outpaint_workflow(
     request: OutpaintRequest = Depends(OutpaintRequest.as_form), stream=False
 ):
     cleanup_resources()
+    print("Pausing LLM Inference...")
+    await pause_llm()
+
     compel_node = CompelNode(
         CompelInputs(
             prompt=request.user_input,
@@ -690,7 +669,7 @@ async def execute_outpaint_workflow(
         )
     )
     # Aggressively free VRAM before outpainting, which is memory-hungry
-    response_node = ResponseNode()
+    response_node = ResponseNode(ResponseInputs(stream=stream))
     embeds = compel_node()
     transformed = transform_node(
         images=[Image.open(request.reference.file).convert("RGB")]
@@ -701,6 +680,37 @@ async def execute_outpaint_workflow(
         **embeds,
     )
     return response_node(**outpainted)
+
+
+@app.post("/workflows/img2img")
+async def execute_image2image_workflow(
+    request: Image2ImageRequest = Depends(Image2ImageRequest.as_form), stream=False
+):
+    cleanup_resources()
+    print("Pausing LLM Inference...")
+    await pause_llm()
+
+    compel_node = CompelNode(
+        CompelInputs(
+            prompt=request.user_input,
+            negative_prompt=request.negative_input,
+            model=request.model,
+        )
+    )
+    img2img_node = Image2ImageNode(
+        Image2ImageInputs(
+            model=request.model,
+            steps=request.steps,
+            strength=request.strength if request.strength is not None else 1.0,
+        )
+    )
+    # Aggressively free VRAM before outpainting, which is memory-hungry
+    response_node = ResponseNode(ResponseInputs(stream=stream))
+    embeds = compel_node()
+    image = img2img_node(
+        images=[Image.open(request.reference.file).convert("RGB")], **embeds
+    )
+    return response_node(**image, stream=stream)
 
 
 @app.post("/workflows/image/")
@@ -724,4 +734,19 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
 @app.post("/cleanup")
 def cleanup():
     cleanup_resources()
-    return {"status": "success"}
+
+    # Python-level cleanup above frees model weights. The CUDA/HIP context
+    # itself (hipBLAS workspace, MIOpen kernel cache, Triton AOT blobs) can
+    # only be freed when the process exits. We execve-restart with
+    # SKIP_PIPELINE_WARMUP=1 so the new process starts with zero GPU
+    # allocations until the first inference request.
+    def _restart():
+        import time
+
+        time.sleep(0.4)  # let the HTTP response flush
+        env = os.environ.copy()
+        env["SKIP_PIPELINE_WARMUP"] = "1"
+        os.execve(_ORIG_ARGV[0], _ORIG_ARGV, env)
+
+    threading.Thread(target=_restart, daemon=False).start()
+    return {"status": "restarting"}

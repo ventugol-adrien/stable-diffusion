@@ -158,3 +158,50 @@ def vram_pressure() -> float:
 def is_vram_pressure_high(threshold: float = 0.70) -> bool:
     """Return True when current VRAM allocation is >= threshold fraction of total."""
     return vram_pressure() >= threshold
+
+
+async def stream_image(image, chunk_size: int = 1024):
+    import asyncio
+    import io
+    import sys
+
+    buffer = io.BytesIO()
+    await asyncio.to_thread(image.save, buffer, format="PNG", interlace=True)
+    total_size = buffer.getbuffer().nbytes
+    buffer.seek(0)
+    bytes_sent = 0
+    while chunk := buffer.read(chunk_size):
+        bytes_sent += len(chunk)
+        percent = (bytes_sent / total_size) * 100
+        bar_length = 30
+        filled_len = int(bar_length * percent // 100)
+        bar = "█" * filled_len + "-" * (bar_length - filled_len)
+        sys.stdout.write(
+            f"\rStreaming: [{bar}] {percent:.1f}% ({bytes_sent}/{total_size} bytes)"
+        )
+        sys.stdout.flush()
+        yield chunk
+        await asyncio.sleep(0)
+    print("\nStreaming complete.")
+
+
+async def stream_zip(zip_buffer, chunk_size: int = 1024):
+    import asyncio
+    import sys
+
+    total_size = zip_buffer.getbuffer().nbytes
+    zip_buffer.seek(0)
+    bytes_sent = 0
+    while chunk := zip_buffer.read(chunk_size):
+        bytes_sent += len(chunk)
+        percent = (bytes_sent / total_size) * 100
+        bar_length = 30
+        filled_len = int(bar_length * percent // 100)
+        bar = "█" * filled_len + "-" * (bar_length - filled_len)
+        sys.stdout.write(
+            f"\rStreaming ZIP: [{bar}] {percent:.1f}% ({bytes_sent}/{total_size} bytes)"
+        )
+        sys.stdout.flush()
+        yield chunk
+        await asyncio.sleep(0)
+    print("\nStreaming ZIP complete.")

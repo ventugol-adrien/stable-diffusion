@@ -50,11 +50,22 @@ def register_cleanup_hook(fn) -> None:
     _cleanup_hooks.append(fn)
 
 
+def _vram_stats() -> str:
+    try:
+        a = torch.cuda.memory_allocated() / 1024**3
+        r = torch.cuda.memory_reserved() / 1024**3
+        return f"allocated={a:.3f} GB  reserved={r:.3f} GB"
+    except Exception:
+        return "<unavailable>"
+
+
 def cleanup_resources():
     """
     Forcefully releases VRAM. Critical for avoiding Linux 6.14 GTT Swap crashes.
     """
-    global _cached_pipe, _cached_fast_pipe, _cached_cpu_vae
+    global _cached_pipe, _cached_fast_pipe, _cached_cpu_vae, _cached_model_name
+
+    print(f"🧹 cleanup_resources: start — {_vram_stats()}")
 
     # Unload IP-Adapter first (holds extra GPU tensors outside the main model)
     for pipe in (_cached_pipe, _cached_fast_pipe):
@@ -77,6 +88,8 @@ def cleanup_resources():
         del _cached_cpu_vae
         _cached_cpu_vae = None
 
+    _cached_model_name = None
+
     # Drop other module caches BEFORE GC so shared CUDA tensors (e.g. UNet/VAE
     # still referenced by _cn_pipe_cache after _cached_pipe is deleted) have
     # their refcount reach zero before gc.collect() + empty_cache() run.
@@ -86,15 +99,58 @@ def cleanup_resources():
         except Exception:
             pass
 
-    # Force Python GC and ROCm cache clear
+    print(f"🧹 after ref-drop — {_vram_stats()}")
+
+    # Collect Python cycles; on ROCm tensor finalizers run synchronously.
     gc.collect()
+    gc.collect()
+
+    print(f"🧹 after gc.collect — {_vram_stats()}")
+
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    # Collect IPC tensor handles (shared-memory tensors from other processes).
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
     try:
         torch.cuda.empty_cache()
     except Exception:
         # HIP context may already be dead after a kernel crash — ignore
         pass
 
-    print("🧹 VRAM resources released.")
+    print(f"🧹 after empty_cache — {_vram_stats()}")
+
+    # One more GC pass in case CUDA callbacks released additional Python objects.
+    gc.collect()
+
+    # ROCm 5.5+ routes hipMalloc/hipFree through a per-process hipMemPool.
+    # empty_cache() above calls hipFree, returning blocks to the pool — but the
+    # pool holds onto the pages so the same process can reuse them cheaply.
+    # Other processes cannot allocate that VRAM until the pool returns the pages
+    # to the OS/driver. hipMemPoolTrimTo(defaultPool, 0) forces that return.
+    if is_rocm():
+        try:
+            import ctypes
+
+            _hip = ctypes.CDLL("libamdhip64.so")
+            _pool = ctypes.c_void_p(None)
+            rc = _hip.hipDeviceGetDefaultMemPool(ctypes.byref(_pool), ctypes.c_int(0))
+            print(f"🧹 hipDeviceGetDefaultMemPool rc={rc}  pool={_pool.value!r}")
+            if rc == 0 and _pool.value is not None:
+                _hip.hipMemPoolTrimTo(_pool, ctypes.c_size_t(0))
+                print(f"🧹 after hipMemPoolTrimTo — {_vram_stats()}")
+            else:
+                print("⚠️ HIP default pool unavailable; skipping trim.")
+        except Exception as e:
+            print(f"⚠️ HIP pool trim failed: {e}")
+
+    print(f"🧹 cleanup_resources: done — {_vram_stats()}")
 
 
 def log_runtime_diagnostics_once():

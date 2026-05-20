@@ -45,8 +45,9 @@ def _clear_cn_cache() -> None:
     those components stay alive on CUDA even after cleanup_resources() deletes
     _cached_pipe, causing OOM on the next get_pipe() call.
     """
-    global _cn_pipe_cache
+    global _cn_pipe_cache, _controlnet_cache
     _cn_pipe_cache.clear()
+    _controlnet_cache = None
 
 
 register_cleanup_hook(_clear_cn_cache)

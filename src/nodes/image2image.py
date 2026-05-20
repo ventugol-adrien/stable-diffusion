@@ -6,6 +6,7 @@ from src.nodes.text2image import Text2ImageInputs
 from src.pipeline import (
     get_pipe,
     decode_latents_safe,
+    encode_image_safe,
     attach_inference_timing,
     finalize_inference_timing,
 )
@@ -46,6 +47,16 @@ class Image2ImageNode(BaseNode):
                 )
                 for img in raw
             ]
+        base_pipe = get_pipe(self.params.model)
+
+        # On ROCm gfx1200 the GPU VAE encoder hangs (hipErrorLaunchFailure).
+        # Pre-encode input images on CPU via encode_image_safe so the pipeline
+        # receives a [B, 4, H/8, W/8] latent tensor and skips its internal
+        # vae.encode() call entirely (diffusers checks shape[1] == 4).
+        if is_rocm() and not isinstance(init_images, torch.Tensor):
+            encoded = [encode_image_safe(base_pipe, img) for img in init_images]
+            init_images = torch.cat(encoded, dim=0)
+
         pipe_kwargs = {
             "image": init_images,
             "width": self.params.width,
@@ -59,7 +70,7 @@ class Image2ImageNode(BaseNode):
         if self.embeds is not None:
             pipe_kwargs.update(self.embeds)
         pipe_kwargs.update(kwargs)
-        pipe = AutoPipelineForImage2Image.from_pipe(get_pipe(self.params.model))
+        pipe = AutoPipelineForImage2Image.from_pipe(base_pipe)
         pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="image2image")
         output = pipe(**pipe_kwargs).images
         finalize_inference_timing("image2image", t0)
