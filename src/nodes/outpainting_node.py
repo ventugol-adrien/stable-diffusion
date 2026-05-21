@@ -104,7 +104,7 @@ def _get_cn_pipe(
             )
             cn_pipe = AutoPipelineForInpainting.from_pipe(base)
 
-        if is_inpaint_unet and is_rocm():
+        if is_rocm() and hasattr(cn_pipe, "_encode_vae_image"):
             # gfx1200 GPU VAE encoder silently produces zeros (hipErrorLaunchFailure).
             # Encode on the dedicated CPU VAE to avoid this. Critically, do NOT convert
             # to PIL first — PIL clamps to uint8 (256 levels), introducing an 8-bit

@@ -119,11 +119,17 @@ from src.nodes.transform_node import TransformInputs, TransformNode
 from src.nodes.outpainting_node import OutpaintingInputs, OutpaintingNode
 from src.nodes.image2image import Image2ImageNode, Image2ImageInputs
 from src.nodes.response_node import ResponseInputs, ResponseNode
-from src.nodes.text2image import Text2ImageNode
+from src.nodes.text2image import Text2ImageInputs, Text2ImageNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
 from src.nodes.compel_node import CompelNode, CompelInputs
-from src.models import DAGForm, Image2ImageRequest, ImageRequest, OutpaintRequest
+from src.models import (
+    DAGForm,
+    Image2ImageRequest,
+    ImageRequest,
+    OutpaintRequest,
+    Text2ImageRequest,
+)
 from compel import CompelForSDXL
 from diffusers import (
     AutoPipelineForImage2Image,
@@ -710,6 +716,34 @@ async def execute_image2image_workflow(
     image = img2img_node(
         images=[Image.open(request.reference.file).convert("RGB")], **embeds
     )
+    return response_node(**image, stream=stream)
+
+
+@app.post("/workflows/txt2img")
+async def execute_text2image_workflow(
+    request: Text2ImageRequest = Depends(Text2ImageRequest.as_form), stream=False
+):
+    cleanup_resources()
+    print("Pausing LLM Inference...")
+    await pause_llm()
+
+    compel_node = CompelNode(
+        CompelInputs(
+            prompt=request.user_input,
+            negative_prompt=request.negative_input,
+            model=request.model,
+        )
+    )
+    txt2img_node = Text2ImageNode(
+        Text2ImageInputs(
+            model=request.model,
+            steps=request.steps,
+        )
+    )
+    # Aggressively free VRAM before outpainting, which is memory-hungry
+    response_node = ResponseNode(ResponseInputs(stream=stream))
+    embeds = compel_node()
+    image = txt2img_node(**embeds)
     return response_node(**image, stream=stream)
 
 

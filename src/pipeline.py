@@ -4,6 +4,7 @@ from diffusers import (
     StableDiffusionXLImg2ImgPipeline,
     AutoPipelineForImage2Image,
     EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
     DPMSolverMultistepScheduler,
     AutoencoderKL,
 )
@@ -290,12 +291,28 @@ def get_pipe(model: str = "juggernaut"):
     try:
         scheduler_config = dict(pipe.scheduler.config)
 
-        if any(k in model.lower() for k in ("vpred", "noob", "illustrious")):
+        is_vpred = any(k in model.lower() for k in ("vpred", "noob"))
+        if is_vpred:
             scheduler_config["prediction_type"] = "v_prediction"
-            print(f"  [Scheduler] Configured for v-prediction for model: {model}")
+            scheduler_config["rescale_betas_zero_snr"] = True
+            scheduler_config["timestep_spacing"] = "trailing"
+            print(
+                f"  [Scheduler] Configured for v-prediction + zero-SNR for model: {model}"
+            )
 
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            scheduler_config, use_karras_sigmas=True
+        if is_vpred:
+            pipe.scheduler = EulerDiscreteScheduler.from_config(scheduler_config)
+        else:
+            # Use the model's native scheduler config (epsilon for illustrious).
+            # Every v_prediction + zero-SNR combination produced grey output —
+            # testing whether the shipped epsilon config produces correct results.
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                scheduler_config, use_karras_sigmas=True
+            )
+        _diag_keys = ("prediction_type", "rescale_betas_zero_snr", "timestep_spacing")
+        _diag = {k: pipe.scheduler.config.get(k, "<absent>") for k in _diag_keys}
+        print(
+            f"  [Scheduler] {pipe.scheduler.__class__.__name__} for '{model}': {_diag}"
         )
     except TypeError:
         pass

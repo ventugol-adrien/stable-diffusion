@@ -54,6 +54,10 @@ class Text2ImageNode(BaseNode):
         pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="text2image")
         output = pipe(**pipe_kwargs).images
         finalize_inference_timing("text2image", t0)
+        if isinstance(output, torch.Tensor):
+            _m = output.float().mean().item()
+            _s = output.float().std().item()
+            print(f"  [txt2img diag] latent mean={_m:.4f}  std={_s:.4f}")
         if force_latent and isinstance(output, torch.Tensor):
             output = decode_latents_safe(pipe, output)
         if isinstance(output, torch.Tensor):

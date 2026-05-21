@@ -74,6 +74,12 @@ class Image2ImageNode(BaseNode):
         pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="image2image")
         output = pipe(**pipe_kwargs).images
         finalize_inference_timing("image2image", t0)
+        if isinstance(output, torch.Tensor):
+            _m = output.float().mean().item()
+            _s = output.float().std().item()
+            print(
+                f"  [img2img diag] strength={self.params.strength:.2f}  latent mean={_m:.4f}  std={_s:.4f}"
+            )
         if force_latent and isinstance(output, torch.Tensor):
             output = decode_latents_safe(pipe, output)
         if isinstance(output, torch.Tensor):
