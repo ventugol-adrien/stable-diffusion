@@ -72,6 +72,12 @@ class Text2ImageNode(BaseNode):
                 )
                 for img in output
             ]
+        if use_ip_adapter:
+            print("Unloading IP Adapter")
+            pipe.unload_ip_adapter()
+            if getattr(pipe, "image_encoder", None) is not None:
+                pipe.image_encoder = None
+            torch.cuda.empty_cache()
         return {"images": output}
 
     def __enter__(self, *args, **kwds):

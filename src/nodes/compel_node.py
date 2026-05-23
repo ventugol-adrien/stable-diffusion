@@ -7,6 +7,7 @@ from src.nodes.base_node import BaseNode, BaseNodeModel
 from diffusers import StableDiffusionXLControlNetPipeline
 from compel import CompelForSDXL
 from torch import Tensor
+import torch
 
 
 class CompelInputs(BaseNodeModel):

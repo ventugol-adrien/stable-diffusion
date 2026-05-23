@@ -233,7 +233,7 @@ class Image2ImageRequest(BaseModel):
                 data[key] = int(value)
             elif key in [
                 "reference",
-                "ip_adapter_image",
+                "ip_image",
             ]:
                 data[key] = value
             elif key in [

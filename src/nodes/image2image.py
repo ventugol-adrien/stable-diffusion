@@ -2,7 +2,7 @@ from diffusers import AutoPipelineForImage2Image
 from pydantic import Field, ConfigDict
 from PIL import Image, ImageOps
 import torch
-from src.nodes.text2image import Text2ImageInputs
+from src.nodes.text2image import IP_ADAPTER_DIR, Text2ImageInputs
 from src.pipeline import (
     get_pipe,
     decode_latents_safe,
@@ -38,6 +38,9 @@ class Image2ImageNode(BaseNode):
     ) -> dict[str, list[Image.Image]]:
         force_latent = is_rocm() and self.params.output_type == "pil"
         raw = images if images is not None else self.images
+        use_ip_adapter = kwargs.get("ip_adapter_image", None) and kwargs.get(
+            "ip_adapter_scale", None
+        )
         if isinstance(raw, torch.Tensor):
             init_images = raw
         else:
@@ -67,10 +70,23 @@ class Image2ImageNode(BaseNode):
             "strength": self.params.strength,
             "output_type": "latent" if force_latent else self.params.output_type,
         }
+        if use_ip_adapter:
+            pipe_kwargs["ip_adapter_image"] = kwargs["ip_adapter_image"]
+            pipe_kwargs["ip_adapter_scale"] = kwargs["ip_adapter_scale"]
+            print(f"Using IP Adapter with scale {pipe_kwargs['ip_adapter_scale']}")
+
         if self.embeds is not None:
             pipe_kwargs.update(self.embeds)
         pipe_kwargs.update(kwargs)
         pipe = AutoPipelineForImage2Image.from_pipe(base_pipe)
+        if use_ip_adapter:
+            pipe.load_ip_adapter(
+                IP_ADAPTER_DIR,
+                subfolder="",
+                weight_name="ip_adapter_plus.safetensors",
+                image_encoder_folder="image_encoder",
+            )
+            pipe.set_ip_adapter_scale(pipe_kwargs["ip_adapter_scale"])
         pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="image2image")
         output = pipe(**pipe_kwargs).images
         finalize_inference_timing("image2image", t0)
@@ -94,4 +110,10 @@ class Image2ImageNode(BaseNode):
                 )
                 for img in output
             ]
+        if use_ip_adapter:
+            print("Unloading IP Adapter")
+            pipe.unload_ip_adapter()
+            if getattr(pipe, "image_encoder", None) is not None:
+                pipe.image_encoder = None
+            torch.cuda.empty_cache()
         return {"images": output}

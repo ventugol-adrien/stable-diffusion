@@ -759,9 +759,21 @@ async def execute_image2image_workflow(
     # Aggressively free VRAM before outpainting, which is memory-hungry
     response_node = ResponseNode(ResponseInputs(stream=stream))
     embeds = compel_node()
-    image = img2img_node(
-        images=[Image.open(request.reference.file).convert("RGB")], **embeds
-    )
+    if request.ip_adapter_image and request.ip_adapter_scale:
+        print("IP-Adapter image and scale provided, adding to Image2ImageNode...")
+        image = img2img_node(
+            images=[Image.open(request.reference.file).convert("RGB")],
+            ip_adapter_image=Image.open(request.ip_adapter_image.file).convert("RGB"),
+            ip_adapter_scale=request.ip_adapter_scale,
+            **embeds,
+        )
+    else:
+        print(
+            "No IP-Adapter provided, proceeding with standard Image2Image generation..."
+        )
+        image = img2img_node(
+            images=[Image.open(request.reference.file).convert("RGB")], **embeds
+        )
     return response_node(**image, stream=stream)
 
 
@@ -826,7 +838,16 @@ def cleanup():
         time.sleep(0.4)  # let the HTTP response flush
         env = os.environ.copy()
         env["SKIP_PIPELINE_WARMUP"] = "1"
-        os.execve(_ORIG_ARGV[0], _ORIG_ARGV, env)
+
+        # 1. Safely resolve the absolute path to your .venv python binary
+        python_exe = os.path.join(sys.prefix, "bin", "python")
+
+        # 2. Reconstruct the startup args.
+        # _ORIG_ARGV[0] is the uvicorn script path (which we drop).
+        # We replace it with "-m", "uvicorn" to perfectly match your ExecStart command.
+        args = [python_exe, "-m", "uvicorn"] + _ORIG_ARGV[1:]
+
+        os.execve(python_exe, args, env)
 
     threading.Thread(target=_restart, daemon=False).start()
     return {"status": "restarting"}
