@@ -68,11 +68,26 @@ def cleanup_resources():
 
     print(f"🧹 cleanup_resources: start — {_vram_stats()}")
 
-    # Unload IP-Adapter first (holds extra GPU tensors outside the main model)
-    for pipe in (_cached_pipe, _cached_fast_pipe):
-        if pipe is not None:
+    # Unload IP-Adapter and zero out every VRAM-resident component so their GPU
+    # tensors are freed immediately — even if a from_pipe() wrapper, a Compel
+    # tokenizer reference, or a Python closure still holds the pipeline object.
+    for _pipe in (_cached_pipe, _cached_fast_pipe):
+        if _pipe is None:
+            continue
+        try:
+            _pipe.unload_ip_adapter()
+        except Exception:
+            pass
+        for _attr in (
+            "unet",
+            "vae",
+            "text_encoder",
+            "text_encoder_2",
+            "image_encoder",
+            "controlnet",
+        ):
             try:
-                pipe.unload_ip_adapter()
+                setattr(_pipe, _attr, None)
             except Exception:
                 pass
 

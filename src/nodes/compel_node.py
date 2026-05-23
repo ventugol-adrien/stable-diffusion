@@ -68,6 +68,13 @@ class CompelNode(BaseNode):
             "negative_pooled_prompt_embeds": conditioning.negative_pooled_embeds,
         }
 
+        for _enc_attr in ("text_encoder", "text_encoder_2"):
+            _enc = getattr(pipe, _enc_attr, None)
+            if _enc is not None:
+                setattr(pipe, _enc_attr, None)
+                del _enc
+        torch.cuda.empty_cache()
+
         return PromptEmbeds(**embeds)
 
     def __enter__(self, *args, **kwds):

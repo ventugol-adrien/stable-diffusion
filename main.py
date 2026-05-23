@@ -798,10 +798,33 @@ async def execute_text2image_workflow(
             steps=request.steps,
         )
     )
+    use_depthmap = request.depth_map and request.depth_map_scale
+    use_edgesmap = request.edges_map and request.edges_map_scale
+    use_controlnet = use_depthmap or use_edgesmap
+    use_ip_adapter = request.ip_adapter_image and request.ip_adapter_scale
     # Aggressively free VRAM before outpainting, which is memory-hungry
     response_node = ResponseNode(ResponseInputs(stream=stream))
     embeds = compel_node()
-    image = txt2img_node(**embeds)
+    inputs = {}
+    if use_depthmap:
+        print(
+            "Depth map and scale provided, adding to Text2ImageNode with ControlNet..."
+        )
+        inputs["depthmap"] = Image.open(request.depth_map.file).convert("RGB")
+        inputs["depthmap_scale"] = request.depth_map_scale
+    if use_edgesmap:
+        print(
+            "Edges map and scale provided, adding to Text2ImageNode with ControlNet..."
+        )
+        inputs["edgesmap"] = Image.open(request.edges_map.file).convert("RGB")
+        inputs["edgesmap_scale"] = request.edges_map_scale
+    if use_ip_adapter:
+        print("IP-Adapter image and scale provided, adding to Text2ImageNode...")
+        inputs["ip_adapter_image"] = Image.open(request.ip_adapter_image.file).convert(
+            "RGB"
+        )
+        inputs["ip_adapter_scale"] = request.ip_adapter_scale
+    image = txt2img_node(**inputs, **embeds)
     return response_node(**image, stream=stream)
 
 

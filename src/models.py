@@ -256,6 +256,10 @@ class Text2ImageRequest(BaseModel):
     model: str = os.environ.get("DEFAULT_MODEL", "juggernaut")
     ip_adapter_scale: float = Field(default=None, alias="ip_scale")
     ip_adapter_image: UploadFile = Field(default=None, alias="ip_image")
+    edges_map: UploadFile = Field(None, alias="edges_map")
+    edges_map_scale: float = Field(None, alias="edges_map_scale")
+    depth_map: UploadFile = Field(None, alias="depth_map")
+    depth_map_scale: float = Field(None, alias="depth_map_scale")
     lightning: bool = False
     image_seed: int = -1
     batch_size: int = 1
@@ -270,7 +274,7 @@ class Text2ImageRequest(BaseModel):
 
             if key in ["user_input", "negative_input", "model"]:
                 data[key] = value
-            elif key in ["strength", "ip_scale"]:
+            elif key in ["strength", "ip_scale", "edges_map_scale", "depth_map_scale"]:
                 data[key] = float(value)
             elif key in ["lightning"]:
                 data[key] = value.lower() == "true"
@@ -278,7 +282,9 @@ class Text2ImageRequest(BaseModel):
                 data[key] = int(value)
             elif key in [
                 "reference",
-                "ip_adapter_image",
+                "ip_image",
+                "edges_map",
+                "depth_map",
             ]:
                 data[key] = value
             elif key in [
