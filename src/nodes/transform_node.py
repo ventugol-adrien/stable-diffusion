@@ -1,4 +1,5 @@
 import math
+from typing import Literal
 
 from PIL import Image, ImageOps
 from pydantic import Field
@@ -24,24 +25,36 @@ class TransformNode(BaseNode):
         self.node_type = "transform"
         self.images: list[Image.Image] = []
 
-    def _transform(self, img: Image.Image) -> tuple[Image.Image, Image.Image]:
+    def _build_affine(self) -> tuple[float, ...] | None:
+        """Return the (a,b,c,d,e,f) affine coefficients, or None if identity."""
+        p = self.params
+        if p.r == 0.0 and p.dx == 0 and p.dy == 0:
+            return None
+        cx, cy = p.width / 2, p.height / 2
+        angle = math.radians(p.r)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        return (
+            cos_a,
+            sin_a,
+            cx - (cx + p.dx) * cos_a - (cy + p.dy) * sin_a,
+            -sin_a,
+            cos_a,
+            cy + (cx + p.dx) * sin_a - (cy + p.dy) * cos_a,
+        )
+
+    def _transform_white(self, img: Image.Image) -> tuple[Image.Image, Image.Image]:
+        """Fill new canvas areas with white and produce a fresh fill-zone mask."""
         p = self.params
         w, h = p.width, p.height
 
-        # Step 1: Resize to target dimensions with LANCZOS.
         img = img.convert("RGB").resize((w, h), Image.LANCZOS)
-
-        # Tracker: single-channel, all-white = every pixel is original content.
-        # Each step fills newly introduced pixels with 0 (black = fill zone).
         tracker = Image.new("L", (w, h), 255)
 
-        # Step 2: Apply zoom via resize (LANCZOS for image, NEAREST for tracker).
         if p.z != 1.0:
             zw = max(1, round(w * p.z))
             zh = max(1, round(h * p.z))
             img = img.resize((zw, zh), Image.LANCZOS)
             tracker = tracker.resize((zw, zh), Image.NEAREST)
-
             canvas_img = Image.new("RGB", (w, h), (255, 255, 255))
             canvas_tracker = Image.new("L", (w, h), 0)
             ox, oy = (w - zw) // 2, (h - zh) // 2
@@ -55,44 +68,78 @@ class TransformNode(BaseNode):
             img = canvas_img
             tracker = canvas_tracker
 
-        # Step 3: Apply rotation + translation via affine (BICUBIC — LANCZOS unsupported).
-        if p.r != 0.0 or p.dx != 0 or p.dy != 0:
-            cx, cy = w / 2, h / 2
-            angle = math.radians(p.r)
-            cos_a = math.cos(angle)
-            sin_a = math.sin(angle)
-
-            a = cos_a
-            b = sin_a
-            c = cx - (cx + p.dx) * cos_a - (cy + p.dy) * sin_a
-            d = -sin_a
-            e = cos_a
-            f = cy + (cx + p.dx) * sin_a - (cy + p.dy) * cos_a
-
+        affine = self._build_affine()
+        if affine is not None:
             img = img.transform(
                 (w, h),
                 Image.AFFINE,
-                (a, b, c, d, e, f),
+                affine,
                 resample=Image.BICUBIC,
                 fillcolor=(255, 255, 255),
             )
             tracker = tracker.transform(
                 (w, h),
                 Image.AFFINE,
-                (a, b, c, d, e, f),
+                affine,
                 resample=Image.NEAREST,
                 fillcolor=0,
             )
 
-        # Invert: 255 = fill zone, 0 = original content.
-        fill_mask = ImageOps.invert(tracker)
-        return img, fill_mask
+        # Invert tracker: 255 = fill zone, 0 = original content.
+        return img, ImageOps.invert(tracker)
+
+    def _transform_black(
+        self, img: Image.Image, mask: Image.Image
+    ) -> tuple[Image.Image, Image.Image]:
+        """Transform only the mask (same geometry as white mode). Image is returned as-is."""
+        p = self.params
+        w, h = p.width, p.height
+
+        mask = mask.convert("L").resize((w, h), Image.NEAREST)
+
+        if p.z != 1.0:
+            zw = max(1, round(w * p.z))
+            zh = max(1, round(h * p.z))
+            mask = mask.resize((zw, zh), Image.NEAREST)
+            canvas_mask = Image.new("L", (w, h), 0)
+            ox, oy = (w - zw) // 2, (h - zh) // 2
+            src_x, src_y = max(0, -ox), max(0, -oy)
+            dst_x, dst_y = max(0, ox), max(0, oy)
+            pw = min(zw - src_x, w - dst_x)
+            ph = min(zh - src_y, h - dst_y)
+            crop = (src_x, src_y, src_x + pw, src_y + ph)
+            canvas_mask.paste(mask.crop(crop), (dst_x, dst_y))
+            mask = canvas_mask
+
+        affine = self._build_affine()
+        if affine is not None:
+            mask = mask.transform(
+                (w, h),
+                Image.AFFINE,
+                affine,
+                resample=Image.NEAREST,
+                fillcolor=0,
+            )
+
+        return img, mask
 
     def __call__(
-        self, images: list[Image.Image] | None = None, *args, **kwargs
+        self,
+        images: list[Image.Image] | None = None,
+        masks: list[Image.Image] | None = None,
+        fill_color: Literal["white", "black"] = "white",
+        *args,
+        **kwargs,
     ) -> dict[str, list[Image.Image]]:
         imgs = images if images is not None else self.images
-        results = [self._transform(img) for img in imgs]
+        if fill_color == "black":
+            if masks is None or len(masks) != len(imgs):
+                raise ValueError(
+                    "fill_color='black' requires one existing mask per image"
+                )
+            results = [self._transform_black(img, m) for img, m in zip(imgs, masks)]
+        else:
+            results = [self._transform_white(img) for img in imgs]
         return {
             "images": [r[0] for r in results],
             "masks": [r[1] for r in results],

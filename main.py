@@ -688,6 +688,52 @@ async def execute_outpaint_workflow(
     return response_node(**outpainted)
 
 
+@app.post("/workflows/inpaint")
+async def execute_inpaint_workflow(
+    request: OutpaintRequest = Depends(OutpaintRequest.as_form), stream=False
+):
+    cleanup_resources()
+    print("Pausing LLM Inference...")
+    await pause_llm()
+
+    compel_node = CompelNode(
+        CompelInputs(
+            prompt=request.user_input,
+            negative_prompt=request.negative_input,
+            model=request.model,
+        )
+    )
+    transform_node = TransformNode(
+        TransformInputs(
+            z=request.transform_z or 1.0,
+            dx=request.transform_dx or 0,
+            dy=request.transform_dy or 0,
+            r=request.transform_r or 0.0,
+        )
+    )
+    outpaint_node = OutpaintingNode(
+        OutpaintingInputs(
+            model=request.model,
+            steps=request.steps,
+            strength=request.strength if request.strength is not None else 1.0,
+        )
+    )
+    # Aggressively free VRAM before outpainting, which is memory-hungry
+    response_node = ResponseNode(ResponseInputs(stream=stream))
+    embeds = compel_node()
+    transformed = transform_node(
+        images=[Image.open(request.reference.file).convert("RGB")],
+        masks=[Image.open(request.mask.file).convert("L")],
+        fill_color="black",
+    )
+    outpainted = outpaint_node(
+        images=transformed["images"],
+        masks=transformed["masks"],
+        **embeds,
+    )
+    return response_node(**outpainted)
+
+
 @app.post("/workflows/img2img")
 async def execute_image2image_workflow(
     request: Image2ImageRequest = Depends(Image2ImageRequest.as_form), stream=False

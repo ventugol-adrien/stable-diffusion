@@ -156,6 +156,7 @@ class OutpaintRequest(BaseModel):
     model: str = os.environ.get("DEFAULT_MODEL", "juggernaut")
     strength: float = None
     reference: UploadFile = None
+    mask: UploadFile = None
     ip_adapter_scale: float = Field(default=None, alias="ip_scale")
     ip_adapter_image: UploadFile = Field(default=None, alias="ip_image")
     lightning: bool = False
@@ -184,7 +185,8 @@ class OutpaintRequest(BaseModel):
                 data[key] = int(value)
             elif key in [
                 "reference",
-                "ip_adapter_image",
+                "ip_image",
+                "mask",
             ]:
                 data[key] = value
             elif key in [

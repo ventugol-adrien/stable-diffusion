@@ -215,7 +215,9 @@ class OutpaintingNode(BaseNode):
         # Sharp masks: precise fill-zone map from TransformNode when available,
         # otherwise fall back to white-pixel detection.
         if masks is not None:
-            sharp_masks = [m.convert("L") for m in masks]
+            sharp_masks = [
+                m.convert("L").resize((p.width, p.height), Image.NEAREST) for m in masks
+            ]
         else:
             sharp_masks = [_make_mask(img, p.white_threshold) for img in init_images]
         masks_pipeline = list(sharp_masks)
