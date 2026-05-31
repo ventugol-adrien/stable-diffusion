@@ -172,7 +172,7 @@ class OutpaintRequest(BaseModel):
         form_data = await request.form()
         data = {}
         for key, value in form_data.multi_items():
-            if value == "":
+            if value in ("", "undefined", "null"):
                 continue
 
             if key in ["user_input", "negative_input", "model"]:
@@ -220,7 +220,7 @@ class Image2ImageRequest(BaseModel):
         form_data = await request.form()
         data = {}
         for key, value in form_data.multi_items():
-            if value == "":
+            if value in ("", "undefined", "null"):
                 continue
 
             if key in ["user_input", "negative_input", "model"]:
@@ -269,7 +269,7 @@ class Text2ImageRequest(BaseModel):
         form_data = await request.form()
         data = {}
         for key, value in form_data.multi_items():
-            if value == "":
+            if value in ("", "undefined", "null"):
                 continue
 
             if key in ["user_input", "negative_input", "model"]:

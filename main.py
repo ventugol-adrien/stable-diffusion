@@ -224,6 +224,7 @@ app.include_router(host_router)
 async def handle_generate_image(
     request: ImageRequest = Depends(ImageRequest.as_form), stream: bool = False
 ):
+    cleanup_resources()
     breakdown = {}
     start_time = time.monotonic()
 
@@ -604,6 +605,7 @@ def get_models():
 
 @app.post("/workflows/")
 def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
+    cleanup_resources()
     model = request.nodes["1"].model
     hires_strength = request.hires_strength
 
@@ -678,7 +680,7 @@ async def execute_outpaint_workflow(
     response_node = ResponseNode(ResponseInputs(stream=stream))
     embeds = compel_node()
     transformed = transform_node(
-        images=[Image.open(request.reference.file).convert("RGB")]
+        fit_resize=True, images=[Image.open(request.reference.file).convert("RGB")]
     )
     outpainted = outpaint_node(
         images=transformed["images"],

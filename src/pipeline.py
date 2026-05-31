@@ -290,13 +290,9 @@ def get_pipe(model: str = "juggernaut"):
     """
     global _cached_pipe, _cached_model_name
 
-    # Return existing pipe if model hasn't changed
+    # Return existing pipe if model hasn't changed within this request
     if _cached_pipe is not None and _cached_model_name == model:
         return _cached_pipe
-
-    if _cached_pipe is not None or _cached_fast_pipe is not None:
-        print("🔄 Switching pipeline/model. Clearing VRAM...")
-        cleanup_resources()
 
     print(f"🚀 Initializing Optimized Pipeline for L40S (Ada Lovelace)...")
 

@@ -42,13 +42,50 @@ class TransformNode(BaseNode):
             cy + (cx + p.dx) * sin_a - (cy + p.dy) * cos_a,
         )
 
-    def _transform_white(self, img: Image.Image) -> tuple[Image.Image, Image.Image]:
+    def _apply_fit(
+        self, img: Image.Image, mask: Image.Image | None = None
+    ) -> tuple[Image.Image, Image.Image, Image.Image | None]:
+        """Scale img so its longest edge fits (width, height), center on white canvas.
+
+        Returns (canvas_img, tracker, canvas_mask) where:
+          tracker: L image, 255 = original content area, 0 = added fill zone.
+          canvas_mask: same convention as input mask, 0 in fill-zone border pixels;
+                       None when no mask was supplied.
+        """
+        w, h = self.params.width, self.params.height
+        iw, ih = img.size
+        scale = min(w / iw, h / ih)
+        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+        ox, oy = (w - nw) // 2, (h - nh) // 2
+
+        canvas = Image.new("RGB", (w, h), (255, 255, 255))
+        canvas.paste(img.convert("RGB").resize((nw, nh), Image.LANCZOS), (ox, oy))
+
+        tracker = Image.new("L", (w, h), 0)
+        tracker.paste(Image.new("L", (nw, nh), 255), (ox, oy))
+
+        if mask is not None:
+            canvas_mask = Image.new("L", (w, h), 0)
+            canvas_mask.paste(
+                mask.convert("L").resize((nw, nh), Image.NEAREST), (ox, oy)
+            )
+            return canvas, tracker, canvas_mask
+
+        return canvas, tracker, None
+
+    def _transform_white(
+        self, img: Image.Image, _fit_tracker: Image.Image | None = None
+    ) -> tuple[Image.Image, Image.Image]:
         """Fill new canvas areas with white and produce a fresh fill-zone mask."""
         p = self.params
         w, h = p.width, p.height
 
-        img = img.convert("RGB").resize((w, h), Image.LANCZOS)
-        tracker = Image.new("L", (w, h), 255)
+        if _fit_tracker is not None:
+            # img is already canvas-sized from _apply_fit; tracker marks fill zones
+            tracker = _fit_tracker
+        else:
+            img = img.convert("RGB").resize((w, h), Image.LANCZOS)
+            tracker = Image.new("L", (w, h), 255)
 
         if p.z != 1.0:
             zw = max(1, round(w * p.z))
@@ -128,18 +165,33 @@ class TransformNode(BaseNode):
         images: list[Image.Image] | None = None,
         masks: list[Image.Image] | None = None,
         fill_color: Literal["white", "black"] = "white",
+        fit_resize: bool = False,
         *args,
         **kwargs,
     ) -> dict[str, list[Image.Image]]:
         imgs = images if images is not None else self.images
+        fit_trackers: list[Image.Image | None] = [None] * len(imgs)
+
+        if fit_resize:
+            prefit = [
+                self._apply_fit(img, m)
+                for img, m in zip(imgs, masks or [None] * len(imgs))
+            ]
+            imgs = [canvas for canvas, _, _ in prefit]
+            fit_trackers = [tracker for _, tracker, _ in prefit]
+            masks = [fm for _, _, fm in prefit] if masks is not None else None
+
         if fill_color == "black":
             if masks is None or len(masks) != len(imgs):
                 raise ValueError(
                     "fill_color='black' requires one existing mask per image"
                 )
             results = [self._transform_black(img, m) for img, m in zip(imgs, masks)]
-        else:
-            results = [self._transform_white(img) for img in imgs]
+        if fill_color == "white":
+            results = [
+                self._transform_white(img, _fit_tracker=t)
+                for img, t in zip(imgs, fit_trackers)
+            ]
         return {
             "images": [r[0] for r in results],
             "masks": [r[1] for r in results],
