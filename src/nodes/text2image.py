@@ -1,5 +1,6 @@
 from typing import Literal
 from pathlib import Path
+import gc
 import torch
 import numpy as np
 from pydantic import Field, ConfigDict
@@ -170,6 +171,13 @@ class Text2ImageNode(BaseNode):
             pipe.unload_ip_adapter()
             if getattr(pipe, "image_encoder", None) is not None:
                 pipe.image_encoder = None
+            torch.cuda.empty_cache()
+        if use_controlnet:
+            # The CN pipeline is not cached — drop it and its controlnet weights now
+            # so VRAM is freed before the next request rather than waiting for GC.
+            pipe.controlnet = None
+            del pipe
+            gc.collect()
             torch.cuda.empty_cache()
         return {"images": output}
 
