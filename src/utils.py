@@ -3,6 +3,7 @@ import subprocess
 import json
 from pydantic import BaseModel, Field
 from typing import Literal
+import re
 
 
 class GPUConfig(BaseModel):
@@ -11,6 +12,7 @@ class GPUConfig(BaseModel):
     )
     name: str = Field(..., description="GPU marketing name")
     vram_gb: float = Field(..., description="Total VRAM in GB")
+    arch: str | None = Field(None, description="ROCm GPU ISA, e.g. gfx1100")
 
 
 class HostConfig(BaseModel):
@@ -35,7 +37,13 @@ def _detect_gpu() -> GPUConfig:
                 plat: Literal["cuda", "rocm"] = (
                     "rocm" if torch.version.hip is not None else "cuda"
                 )
-                return GPUConfig(platform=plat, name=name, vram_gb=vram)
+                arch = getattr(props, "gcnArchName", None)
+                if isinstance(arch, bytes):
+                    arch = arch.decode("utf-8", errors="ignore")
+                if isinstance(arch, str):
+                    match = re.search(r"gfx[0-9a-fA-F]+", arch)
+                    arch = match.group(0).lower() if match else arch.lower()
+                return GPUConfig(platform=plat, name=name, vram_gb=vram, arch=arch)
         except Exception:
             pass
 
@@ -65,20 +73,33 @@ def _detect_gpu() -> GPUConfig:
     try:
         rinfo = subprocess.run(["rocminfo"], capture_output=True, text=True, timeout=5)
         gpu_names: list[str] = []
+        gpu_arches: list[str] = []
         if rinfo.returncode == 0:
             current_name: str | None = None
+            current_arch: str | None = None
             for line in rinfo.stdout.splitlines():
                 s = line.strip()
                 if s.startswith("Agent ") and s[6:].strip().isdigit():
                     current_name = None
+                    current_arch = None
                 elif s.startswith("Marketing Name:"):
                     current_name = s.split(":", 1)[1].strip() or None
+                elif s.startswith("Name:"):
+                    match = re.search(r"gfx[0-9a-fA-F]+", s)
+                    if match:
+                        current_arch = match.group(0).lower()
+                elif s.startswith("ISA:"):
+                    match = re.search(r"gfx[0-9a-fA-F]+", s)
+                    if match:
+                        current_arch = match.group(0).lower()
                 elif (
                     s.startswith("Device Type:")
                     and s.split(":", 1)[1].strip() == "GPU"
                     and current_name
                 ):
                     gpu_names.append(current_name)
+                    if current_arch:
+                        gpu_arches.append(current_arch)
 
         rsmi = subprocess.run(
             ["rocm-smi", "--showmeminfo", "vram", "--json"],
@@ -96,7 +117,8 @@ def _detect_gpu() -> GPUConfig:
                     break
 
         name = gpu_names[0] if gpu_names else "Unknown AMD GPU"
-        return GPUConfig(platform="rocm", name=name, vram_gb=vram_gb)
+        arch = gpu_arches[0] if gpu_arches else None
+        return GPUConfig(platform="rocm", name=name, vram_gb=vram_gb, arch=arch)
     except Exception:
         pass
 
@@ -135,6 +157,57 @@ def is_rocm() -> bool:
 
 def vram_gb() -> float:
     return HOST_CONFIG.gpu.vram_gb
+
+
+def gpu_arch() -> str | None:
+    return HOST_CONFIG.gpu.arch
+
+
+def is_rocm_gfx1100() -> bool:
+    return is_rocm() and HOST_CONFIG.gpu.arch == "gfx1100"
+
+
+def is_rocm_gfx1200() -> bool:
+    return is_rocm() and HOST_CONFIG.gpu.arch == "gfx1200"
+
+
+def is_w7800() -> bool:
+    return is_rocm() and "w7800" in HOST_CONFIG.gpu.name.lower()
+
+
+def requested_rocm_profile() -> str:
+    import os
+
+    profile = os.environ.get("SD_ROCM_PROFILE", "auto").strip().lower()
+    aliases = {
+        "safe": "compat",
+        "fallback": "compat",
+        "conservative": "compat",
+        "gfx1200": "compat",
+        "optimized": "w7800",
+        "native": "w7800",
+    }
+    profile = aliases.get(profile, profile)
+    if profile not in {"auto", "w7800", "compat"}:
+        return "auto"
+    return profile
+
+
+def rocm_profile() -> str:
+    if not is_rocm():
+        return "none"
+
+    requested = requested_rocm_profile()
+    if requested != "auto":
+        return requested
+
+    if (is_w7800() or is_rocm_gfx1100()) and has_vram_gte(24.0):
+        return "w7800"
+    return "compat"
+
+
+def is_rocm_compat_profile() -> bool:
+    return rocm_profile() == "compat"
 
 
 def has_vram_gte(gb: float) -> bool:

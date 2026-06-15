@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Request, UploadFile, File
 from PIL import Image
 
-from src.nodes.compel_node import CompelInputs, CompelNode
+from src.nodes.qwen_node import QwenInputs
 from src.nodes.text2image import Text2ImageInputs, Text2ImageNode
 from src.nodes.image2image import Image2ImageInputs, Image2ImageNode
 from src.nodes.base_node import BaseNode
@@ -89,7 +89,7 @@ class DAGForm(BaseModel):
             init_image=decoded_init_image,
             hires_strength=hires_strength,
             nodes={
-                "0": CompelInputs(
+                "0": QwenInputs(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
                     model=model,
@@ -157,6 +157,10 @@ class OutpaintRequest(BaseModel):
     strength: float = None
     reference: UploadFile = None
     mask: UploadFile = None
+    edges_map: UploadFile = Field(None, alias="edges_map")
+    edges_map_scale: float = Field(None, alias="edges_map_scale")
+    depth_map: UploadFile = Field(None, alias="depth_map")
+    depth_map_scale: float = Field(None, alias="depth_map_scale")
     ip_adapter_scale: float = Field(default=None, alias="ip_scale")
     ip_adapter_image: UploadFile = Field(default=None, alias="ip_image")
     lightning: bool = False
@@ -177,7 +181,12 @@ class OutpaintRequest(BaseModel):
 
             if key in ["user_input", "negative_input", "model"]:
                 data[key] = value
-            elif key in ["strength", "ip_scale"]:
+            elif key in [
+                "strength",
+                "ip_scale",
+                "edges_map_scale",
+                "depth_map_scale",
+            ]:
                 data[key] = float(value)
             elif key in ["lightning"]:
                 data[key] = value.lower() == "true"
@@ -187,6 +196,8 @@ class OutpaintRequest(BaseModel):
                 "reference",
                 "ip_image",
                 "mask",
+                "edges_map",
+                "depth_map",
             ]:
                 data[key] = value
             elif key in [
@@ -251,8 +262,12 @@ class Image2ImageRequest(BaseModel):
 class Text2ImageRequest(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
     steps: int = Field(50, ge=1, le=150)
+    cfg_scale: float = Field(7.5, ge=0.0, le=20.0)
     user_input: str
     negative_input: str = ""
+    prompt_embedding: Literal["qwen", "compel"] = Field(
+        "compel", alias="embedding_mode"
+    )
     model: str = os.environ.get("DEFAULT_MODEL", "juggernaut")
     ip_adapter_scale: float = Field(default=None, alias="ip_scale")
     ip_adapter_image: UploadFile = Field(default=None, alias="ip_image")
@@ -260,6 +275,11 @@ class Text2ImageRequest(BaseModel):
     edges_map_scale: float = Field(None, alias="edges_map_scale")
     depth_map: UploadFile = Field(None, alias="depth_map")
     depth_map_scale: float = Field(None, alias="depth_map_scale")
+    normalize_embeddings: bool = Field(default=False, alias="normalize_embeddings")
+    use_input_layernorm: bool | None = Field(
+        default=None,
+        description="Optional override for projector trunk LayerNorm. The existing API name is kept for compatibility.",
+    )
     lightning: bool = False
     image_seed: int = -1
     batch_size: int = 1
@@ -272,11 +292,21 @@ class Text2ImageRequest(BaseModel):
             if value in ("", "undefined", "null"):
                 continue
 
-            if key in ["user_input", "negative_input", "model"]:
+            if key in ["user_input", "negative_input", "model", "embedding_mode"]:
                 data[key] = value
-            elif key in ["strength", "ip_scale", "edges_map_scale", "depth_map_scale"]:
+            elif key in [
+                "strength",
+                "ip_scale",
+                "edges_map_scale",
+                "depth_map_scale",
+                "cfg_scale",
+            ]:
                 data[key] = float(value)
-            elif key in ["lightning"]:
+            elif key in [
+                "lightning",
+                "normalize_embeddings",
+                "use_input_layernorm",
+            ]:
                 data[key] = value.lower() == "true"
             elif key in ["image_seed", "batch_size", "steps"]:
                 data[key] = int(value)
@@ -395,3 +425,20 @@ class ImageRequest(BaseModel):
             data["loras"] = existing + sorted_loras
 
         return cls.model_validate(data)
+
+
+class SpatialAssetsRequest(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, populate_by_name=True)
+    image: UploadFile = Field(
+        ..., description="Input image for spatial asset generation", alias="reference"
+    )
+
+    @classmethod
+    async def as_form(cls, request: Request) -> "SpatialAssetsRequest":
+        form_data = await request.form()
+        image = form_data.get("reference") or form_data.get("image")
+        if image is None:
+            raise ValueError(
+                "Missing required 'reference' or 'image' field in form data"
+            )
+        return cls(image=image)

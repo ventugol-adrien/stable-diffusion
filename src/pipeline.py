@@ -12,7 +12,8 @@ from pathlib import Path
 import os, gc, time
 import re
 import torch
-from src.utils import is_rocm, vram_gb, has_vram_gte
+from src.gpu_telemetry import start_gpu_telemetry, telemetry_enabled, telemetry_status
+from src.utils import gpu_arch, is_rocm, rocm_profile, vram_gb, has_vram_gte
 
 _cached_pipe: StableDiffusionXLPipeline | None = None
 _cached_fast_pipe: StableDiffusionXLPipeline | None = None
@@ -30,6 +31,7 @@ CWD = Path(os.getcwd())
 MODEL_CACHE_DIR = CWD / "caches" / "models"
 WARMED_CONFIGS_FILE = CWD / "caches" / "warmed_configs.json"
 MODELS_DIR = Path.home() / "sd_models"
+VRAM_THRESHOLD_GB = 24.0  # AMD GPU VRAM
 _warmed_configs_cache: set[str] | None = None  # in-memory cache of config keys
 _runtime_diag_logged = False
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -39,6 +41,85 @@ torch.backends.cudnn.allow_tf32 = True
 # so PyTorch uses its built-in CUDA kernels for conv and SDPA instead.
 torch.backends.cudnn.enabled = False
 torch.backends.cuda.enable_cudnn_sdp(False)
+
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    return default
+
+
+def _w7800_perf_mode() -> bool:
+    return rocm_profile() == "w7800" and _env_flag("SD_W7800_PERF_MODE", False)
+
+
+def should_use_channels_last() -> bool:
+    return _env_flag(
+        "SD_ENABLE_CHANNELS_LAST",
+        default=rocm_profile() == "w7800",
+    )
+
+
+def should_fuse_qkv_projections() -> bool:
+    return _env_flag("SD_FUSE_QKV_PROJECTIONS", default=_w7800_perf_mode())
+
+
+def should_compile_unet() -> bool:
+    return _env_flag("SD_COMPILE_UNET", default=_w7800_perf_mode())
+
+
+def should_disable_diffusers_progress() -> bool:
+    return _env_flag("SD_DISABLE_DIFFUSERS_PROGRESS", default=True)
+
+
+def should_time_denoise_steps() -> bool:
+    return _env_flag("SD_INFERENCE_STEP_TIMING", default=telemetry_enabled())
+
+
+def should_log_each_denoise_step() -> bool:
+    return _env_flag("SD_LOG_DENOISE_STEPS", default=False)
+
+
+def should_collect_step_memory_stats() -> bool:
+    return _env_flag("SD_STEP_MEMORY_STATS", default=False)
+
+
+def should_use_manual_vae_decode() -> bool:
+    return _env_flag("SD_MANUAL_VAE_DECODE", default=False)
+
+
+def is_low_vram_rocm() -> bool:
+    return is_rocm() and not has_vram_gte(VRAM_THRESHOLD_GB)
+
+
+def needs_rocm_vae_cpu_workaround() -> bool:
+    if not is_rocm():
+        return False
+    if os.environ.get("SD_FORCE_CPU_VAE", "0") == "1":
+        return True
+    return rocm_profile() == "compat" or is_low_vram_rocm()
+
+
+def should_force_latent_output() -> bool:
+    return is_rocm() and needs_rocm_vae_cpu_workaround()
+
+
+def should_decode_vae_on_gpu() -> bool:
+    if not is_rocm():
+        return False
+    if os.environ.get("SD_FORCE_CPU_VAE", "0") == "1":
+        return False
+    return not needs_rocm_vae_cpu_workaround()
 
 
 def register_cleanup_hook(fn) -> None:
@@ -180,6 +261,12 @@ def log_runtime_diagnostics_once():
         f"   torch={torch.__version__} cuda={torch.version.cuda} hip={torch.version.hip}"
     )
     print(f"   is_rocm={is_rocm()} vram_gb={vram_gb():.1f}")
+    print(f"   gpu_arch={gpu_arch() or '<unknown>'} rocm_profile={rocm_profile()}")
+    print(
+        f"   low_vram_rocm={is_low_vram_rocm()} "
+        f"vae_cpu_workaround={needs_rocm_vae_cpu_workaround()} "
+        f"force_latent={should_force_latent_output()}"
+    )
     print(
         "   env HSA_OVERRIDE_GFX_VERSION="
         f"{os.environ.get('HSA_OVERRIDE_GFX_VERSION', '<unset>')}"
@@ -193,50 +280,177 @@ def log_runtime_diagnostics_once():
         "   env TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL="
         f"{os.environ.get('TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL', '<unset>')}"
     )
+    perf_status = telemetry_status()
+    print(
+        "   perf telemetry="
+        f"enabled={perf_status['enabled']} backend={perf_status['backend']} "
+        f"interval={perf_status['interval_seconds']}s jsonl={perf_status['jsonl_path']}"
+    )
+    print(
+        "   perf knobs="
+        f"channels_last={should_use_channels_last()} "
+        f"fuse_qkv={should_fuse_qkv_projections()} "
+        f"compile_unet={should_compile_unet()} "
+        f"step_timing={should_time_denoise_steps()} "
+        f"step_logs={should_log_each_denoise_step()} "
+        f"manual_vae_decode={should_use_manual_vae_decode()}"
+    )
     _runtime_diag_logged = True
 
 
-def attach_inference_timing(pipe_kwargs: dict, label: str) -> tuple[dict, float]:
+def _telemetry_metadata_from_kwargs(
+    label: str, pipe_kwargs: dict, metadata: dict | None
+):
+    result = {
+        "label": label,
+        "width": pipe_kwargs.get("width"),
+        "height": pipe_kwargs.get("height"),
+        "steps": pipe_kwargs.get("num_inference_steps"),
+        "guidance_scale": pipe_kwargs.get("guidance_scale"),
+        "batch_size": pipe_kwargs.get("num_images_per_prompt"),
+        "output_type": pipe_kwargs.get("output_type"),
+        "rocm_profile": rocm_profile(),
+        "gpu_arch": gpu_arch(),
+        "vram_gb": vram_gb(),
+        "low_vram_rocm": is_low_vram_rocm(),
+        "vae_cpu_workaround": needs_rocm_vae_cpu_workaround(),
+        "force_latent": should_force_latent_output(),
+        "manual_vae_decode": should_use_manual_vae_decode(),
+    }
+    if metadata:
+        result.update(metadata)
+    return result
+
+
+def attach_inference_timing(
+    pipe_kwargs: dict, label: str, metadata: dict | None = None
+):
     """
     Attach per-request denoise-step timing logs to a diffusers call.
     """
     t0 = time.monotonic()
     steps = int(pipe_kwargs.get("num_inference_steps") or 0)
+    sampler = start_gpu_telemetry(
+        label, _telemetry_metadata_from_kwargs(label, pipe_kwargs, metadata)
+    )
     print(f"⏱️  {label}: dispatching pipeline call (steps={steps})")
+
+    if not should_time_denoise_steps():
+        return pipe_kwargs, t0, sampler
 
     if "callback_on_step_end" in pipe_kwargs:
         print(f"⏱️  {label}: callback already provided; pre-step timing unavailable.")
-        return pipe_kwargs, t0
+        return pipe_kwargs, t0, sampler
 
     first_step_logged = False
+    first_step_latency: float | None = None
+    last_step_time = t0
+    step_durations: list[float] = []
+    log_steps = should_log_each_denoise_step()
+    collect_memory_stats = should_collect_step_memory_stats()
 
     def on_step_end(_pipe, step_index, _timestep, callback_kwargs):
-        nonlocal first_step_logged
-        peak = torch.cuda.max_memory_allocated() / (1024**3)
-        reserved = torch.cuda.memory_reserved() / (1024**3)
-        torch.cuda.reset_peak_memory_stats()
+        nonlocal first_step_logged, first_step_latency, last_step_time
+        now = time.monotonic()
+        step_durations.append(now - last_step_time)
+        last_step_time = now
+        peak = None
+        reserved = None
+        if collect_memory_stats:
+            peak = torch.cuda.max_memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            torch.cuda.reset_peak_memory_stats()
         step_str = f"step={step_index + 1}/{max(steps, 1)}"
         if not first_step_logged:
-            elapsed = time.monotonic() - t0
-            print(
-                f"⏱️  {label}: first denoise step reached in {elapsed:.2f}s "
-                f"({step_str}) | GPU peak={peak:.2f} GB reserved={reserved:.2f} GB"
-            )
+            elapsed = now - t0
+            first_step_latency = elapsed
+            message = f"⏱️  {label}: first denoise step reached in {elapsed:.2f}s ({step_str})"
+            if peak is not None and reserved is not None:
+                message += f" | GPU peak={peak:.2f} GB reserved={reserved:.2f} GB"
+            print(message)
             first_step_logged = True
-        else:
-            print(
-                f"⏱️  {label}: {step_str} | GPU peak={peak:.2f} GB reserved={reserved:.2f} GB"
-            )
+        elif log_steps:
+            message = f"⏱️  {label}: {step_str}"
+            if peak is not None and reserved is not None:
+                message += f" | GPU peak={peak:.2f} GB reserved={reserved:.2f} GB"
+            print(message)
         return callback_kwargs
 
     pipe_kwargs["callback_on_step_end"] = on_step_end
     pipe_kwargs["callback_on_step_end_tensor_inputs"] = []
-    return pipe_kwargs, t0
+    sampler.first_step_latency = lambda: first_step_latency
+    sampler.step_durations = step_durations
+    return pipe_kwargs, t0, sampler
 
 
-def finalize_inference_timing(label: str, t0: float):
+def finalize_inference_timing(label: str, t0: float, sampler=None):
     elapsed = time.monotonic() - t0
     print(f"⏱️  {label}: pipeline call finished in {elapsed:.2f}s")
+    if sampler is not None:
+        first_step_latency = None
+        first_step_fn = getattr(sampler, "first_step_latency", None)
+        if callable(first_step_fn):
+            first_step_latency = first_step_fn()
+        step_durations = list(getattr(sampler, "step_durations", []))
+        extra = {"elapsed_seconds": elapsed}
+        if first_step_latency is not None:
+            extra["first_step_latency_seconds"] = first_step_latency
+        if step_durations:
+            denoise_seconds = sum(step_durations)
+            extra["step_duration_avg_seconds"] = sum(step_durations) / len(
+                step_durations
+            )
+            extra["step_duration_max_seconds"] = max(step_durations)
+            extra["step_count"] = len(step_durations)
+            extra["denoise_seconds"] = denoise_seconds
+            if denoise_seconds > 0:
+                extra["denoise_steps_per_second"] = (
+                    len(step_durations) / denoise_seconds
+                )
+        sampler.finish(extra=extra)
+
+
+def _apply_runtime_optimizations(pipe: StableDiffusionXLPipeline) -> None:
+    if should_disable_diffusers_progress():
+        try:
+            pipe.set_progress_bar_config(disable=True)
+        except Exception as exc:
+            print(f"  [Perf] Could not disable Diffusers progress bar: {exc}")
+
+    if should_use_channels_last():
+        for module_name in ("unet", "vae"):
+            module = getattr(pipe, module_name, None)
+            if module is None:
+                continue
+            try:
+                module.to(memory_format=torch.channels_last)
+                print(f"  [Perf] {module_name}: channels_last memory format enabled")
+            except Exception as exc:
+                print(f"  [Perf] {module_name}: channels_last unavailable ({exc})")
+
+    if should_fuse_qkv_projections():
+        try:
+            if hasattr(pipe, "fuse_qkv_projections"):
+                pipe.fuse_qkv_projections()
+                print("  [Perf] Fused QKV projections enabled")
+            else:
+                print("  [Perf] Fused QKV projections unavailable on this pipeline")
+        except Exception as exc:
+            print(f"  [Perf] Fused QKV projections failed ({exc})")
+
+    if should_compile_unet():
+        mode = os.environ.get("SD_COMPILE_UNET_MODE", "reduce-overhead")
+        fullgraph = _env_flag("SD_COMPILE_UNET_FULLGRAPH", default=False)
+        try:
+            t_compile = time.monotonic()
+            pipe.unet = torch.compile(pipe.unet, mode=mode, fullgraph=fullgraph)
+            print(
+                "  [Perf] UNet torch.compile prepared "
+                f"mode={mode} fullgraph={fullgraph} in {time.monotonic() - t_compile:.2f}s; "
+                "first matching request will compile kernels."
+            )
+        except Exception as exc:
+            print(f"  [Perf] UNet torch.compile unavailable ({exc})")
 
 
 def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
@@ -294,7 +508,7 @@ def get_pipe(model: str = "juggernaut"):
     if _cached_pipe is not None and _cached_model_name == model:
         return _cached_pipe
 
-    print(f"🚀 Initializing Optimized Pipeline for L40S (Ada Lovelace)...")
+    print(f"🚀 Initializing optimized SDXL pipeline (profile={rocm_profile()})...")
 
     pipe = _load_pipeline(model)
 
@@ -338,9 +552,9 @@ def get_pipe(model: str = "juggernaut"):
     # its accelerate hooks corrupt the GPU context for the VAE conv upsampler.
     # VAE tiling and slicing are re-enabled: they are not confirmed causes of the hangs.
     # On CUDA with sufficient VRAM these concerns don't apply.
-    if is_rocm() and not has_vram_gte(24.0):
+    if needs_rocm_vae_cpu_workaround():
         print(
-            f"⚠️  ROCm GPU has {vram_gb():.1f} GB VRAM — enabling VAE tiling and slicing."
+            f"⚠️  ROCm profile={rocm_profile()} vram={vram_gb():.1f} GB — enabling VAE tiling and slicing."
         )
         pipe.vae.enable_tiling()
         pipe.vae.enable_slicing()
@@ -356,6 +570,9 @@ def get_pipe(model: str = "juggernaut"):
 
     # 7. TRANSFER TO GPU — keep all sub-models resident; no accelerate offload hooks.
     pipe.to("cuda")
+    _apply_runtime_optimizations(pipe)
+    if needs_rocm_vae_cpu_workaround():
+        pipe.vae.to("cpu")
 
     _cached_pipe = pipe
     _cached_model_name = model
@@ -388,7 +605,7 @@ def warmup_pipeline(
             # When ROCBLAS_USE_HIPBLASLT=0, rocBLAS routes through Tensile which may
             # have the gfx1200 VAE upsampler kernel.  Test GPU decode; SIGABRT here
             # means Tensile also lacks the kernel — remove the env var to revert.
-            if os.environ.get("ROCBLAS_USE_HIPBLASLT") == "0":
+            if should_decode_vae_on_gpu():
                 decode_latents_safe(pipe, latents)
             else:
                 # gfx1200 (RDNA4) crashes with SIGABRT on GPU VAE decode — always use CPU.
@@ -468,10 +685,26 @@ def warmup_pipeline(
 
     print(
         "🔥 Warming up base pipeline "
-        f"({run_width}x{run_height}, 1 step + VAE decode)..."
+        f"({run_width}x{run_height}, 1 step + VAE decode). "
+        "First ROCm run may compile kernels..."
     )
     t0 = time.monotonic()
-    run_warmup(run_width, run_height)
+    sampler = start_gpu_telemetry(
+        "warmup_pipeline",
+        {
+            "model": model,
+            "width": run_width,
+            "height": run_height,
+            "steps": 1,
+            "selected_key": selected_key,
+            "target_key": warmup_key,
+            "rocm_profile": rocm_profile(),
+        },
+    )
+    try:
+        run_warmup(run_width, run_height)
+    finally:
+        sampler.finish(extra={"elapsed_seconds": time.monotonic() - t0})
     print(f"   Warmed in {time.monotonic() - t0:.1f}s")
     if run_width == width and run_height == height:
         save_warmup(warmup_key)
@@ -498,11 +731,17 @@ def generate_image(pipe, **kwargs):
     # On ROCm, get latents first so we can measure VRAM at the peak of denoising,
     # then attempt GPU decode (VAE tiling keeps GEMM sizes small enough to avoid the
     # gfx1200 upsampler crash).  Fall back to CPU decode if anything goes wrong.
-    force_latent = is_rocm() and kwargs.get("output_type", "pil") == "pil"
+    force_latent = (
+        should_force_latent_output() and kwargs.get("output_type", "pil") == "pil"
+    )
     if force_latent:
         kwargs["output_type"] = "latent"
 
-    kwargs, t0 = attach_inference_timing(kwargs, label="generate_image")
+    kwargs, t0, sampler = attach_inference_timing(
+        kwargs,
+        label="generate_image",
+        metadata={"seed": seed, "pipeline": type(pipe).__name__},
+    )
     print(
         f"⏱️  generate_image: calling pipe ({type(pipe).__name__}) with keys: {[k for k in kwargs if k != 'callback_on_step_end']}"
     )
@@ -513,13 +752,13 @@ def generate_image(pipe, **kwargs):
     is_img2img = "image" in kwargs and isinstance(
         kwargs["image"], __import__("PIL").Image.Image
     )
-    if is_rocm() and is_img2img:
+    if needs_rocm_vae_cpu_workaround() and is_img2img:
         kwargs["image"] = encode_image_safe(pipe, kwargs["image"])
 
     output = pipe(**kwargs).images
 
     print(f"⏱️  generate_image: pipe() returned, output type={type(output).__name__}")
-    finalize_inference_timing("generate_image", t0)
+    finalize_inference_timing("generate_image", t0, sampler)
 
     if force_latent and isinstance(output, torch.Tensor):
         vram_alloc = torch.cuda.memory_allocated()
@@ -599,7 +838,15 @@ def decode_latents_on_gpu(pipe, latents: torch.Tensor) -> list:
     VAE upsampler GEMM shapes — requires ROCBLAS_USE_HIPBLASLT=0 on gfx1200."""
     scaling = float(getattr(pipe.vae.config, "scaling_factor", 0.18215))
     t_gpu = time.monotonic()
+    sampler = start_gpu_telemetry(
+        "vae_decode_gpu",
+        {"rocm_profile": rocm_profile(), "latent_shape": tuple(latents.shape)},
+    )
     from PIL import Image
+
+    vae_device = next(pipe.vae.parameters()).device
+    if vae_device.type != "cuda":
+        pipe.vae.to("cuda")
 
     with torch.inference_mode():
         decoded = pipe.vae.decode(latents / scaling, return_dict=False)[0]
@@ -610,7 +857,9 @@ def decode_latents_on_gpu(pipe, latents: torch.Tensor) -> list:
         )
         for img in decoded
     ]
-    print(f"⏱️  GPU VAE decode: {time.monotonic() - t_gpu:.2f}s")
+    elapsed = time.monotonic() - t_gpu
+    sampler.finish(extra={"elapsed_seconds": elapsed})
+    print(f"⏱️  GPU VAE decode: {elapsed:.2f}s")
     return images
 
 
@@ -625,6 +874,9 @@ def encode_image_safe(pipe, image) -> torch.Tensor:
     scaling = float(getattr(pipe.vae.config, "scaling_factor", 0.18215))
 
     t_enc = time.monotonic()
+    sampler = start_gpu_telemetry(
+        "vae_encode_cpu", {"rocm_profile": rocm_profile(), "image_size": image.size}
+    )
     print("📦 CPU VAE encode: encoding input image to latents...")
     with torch.inference_mode():
         img_tensor = (
@@ -637,8 +889,12 @@ def encode_image_safe(pipe, image) -> torch.Tensor:
         img_tensor = img_tensor * 2.0 - 1.0
         latents = cpu_vae.encode(img_tensor, return_dict=False)[0].mean * scaling
     latents = latents.to("cuda", dtype=torch.float16)
+    elapsed = time.monotonic() - t_enc
+    sampler.finish(
+        extra={"elapsed_seconds": elapsed, "latent_shape": tuple(latents.shape)}
+    )
     print(
-        f"⏱️  CPU VAE encode finished in {time.monotonic() - t_enc:.2f}s  shape={tuple(latents.shape)}"
+        f"⏱️  CPU VAE encode finished in {elapsed:.2f}s  shape={tuple(latents.shape)}"
     )
     return latents
 
@@ -646,11 +902,15 @@ def encode_image_safe(pipe, image) -> torch.Tensor:
 def decode_latents_safe(pipe, latents: torch.Tensor):
     """
     Decode latent tensors to PIL images.
-    On ROCm with ROCBLAS_USE_HIPBLASLT=0, attempts GPU decode (Tensile backend).
-    Falls back to CPU decode otherwise — gfx1200 hipBLASLT path causes SIGABRT.
+    Above the ROCm low-VRAM threshold, prefer GPU decode for lower latency.
+    Below the threshold, only use GPU decode when explicitly routed through Tensile.
     """
-    if is_rocm() and os.environ.get("ROCBLAS_USE_HIPBLASLT") == "0":
-        return decode_latents_on_gpu(pipe, latents)
+    if should_decode_vae_on_gpu():
+        try:
+            return decode_latents_on_gpu(pipe, latents)
+        finally:
+            if needs_rocm_vae_cpu_workaround():
+                pipe.vae.to("cpu")
     return decode_latents_on_cpu(pipe, latents)
 
 
@@ -670,6 +930,10 @@ def decode_latents_on_cpu(pipe, latents: torch.Tensor):
     if _is_first_decode:
         print("🔨 First CPU VAE decode — torch.compile JIT compilation starting...")
     t_cpu = time.monotonic()
+    sampler = start_gpu_telemetry(
+        "vae_decode_cpu",
+        {"rocm_profile": rocm_profile(), "latent_shape": tuple(latents.shape)},
+    )
     with torch.inference_mode():
         latents_cpu = (
             latents.detach()
@@ -686,6 +950,7 @@ def decode_latents_on_cpu(pipe, latents: torch.Tensor):
             for img in decoded_batch
         ]
     elapsed = time.monotonic() - t_cpu
+    sampler.finish(extra={"elapsed_seconds": elapsed})
     if _is_first_decode:
         decode_latents_on_cpu._compiled_and_warmed = True
         print(f"⏱️  CPU VAE decode (first, includes JIT compile): {elapsed:.2f}s")

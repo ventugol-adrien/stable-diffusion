@@ -17,7 +17,7 @@ class ResponseInputs(BaseNodeModel):
         "image/png", description="Media type for single-image response"
     )
     filename: str = Field("image", description="Base filename (without extension)")
-    stream: bool = Field(False, description="Whether to stream the response")
+    stream: bool = Field(True, description="Whether to stream the response")
     model_config = ConfigDict(extra="allow")
 
 

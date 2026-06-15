@@ -15,6 +15,7 @@ if _env_file.exists():
 
 # Captured before uvicorn mutates argv — used by /cleanup to execve-restart.
 _ORIG_ARGV = sys.argv[:]
+from src.nodes.compel_node import CompelInputs, CompelNode
 from src.llama import pause_llm
 from src.classes import PNGStreamingResponse, ZipStreamingResponse
 from typing import AsyncIterable
@@ -44,6 +45,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 _LOG_DIR = Path(os.environ.get("SD_LOG_DIR", _PROJECT_ROOT / "logs"))
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+os.environ.setdefault("SD_RUN_ID", _RUN_ID)
+os.environ.setdefault("SD_LOG_DIR", str(_LOG_DIR))
+os.environ.setdefault("SD_GPU_TELEMETRY_JSONL", str(_LOG_DIR / f"perf_{_RUN_ID}.jsonl"))
 _STDOUT_LOG_FILE = _LOG_DIR / f"runtime_{_RUN_ID}.stdout.log"
 _STDERR_LOG_FILE = _LOG_DIR / f"runtime_{_RUN_ID}.stderr.log"
 
@@ -65,17 +69,29 @@ os.environ.setdefault("ROCBLAS_LOG_PATH", str(_LOG_DIR / f"rocblas_{_RUN_ID}.log
 # src.utils._detect_gpu() uses only subprocess (rocminfo/nvidia-smi), safe here.
 from src.utils import (
     is_rocm as _is_rocm,
+    rocm_profile as _rocm_profile,
     is_vram_pressure_high,
     stream_image,
     stream_zip,
 )
 
 if _is_rocm():
-    # HSA_OVERRIDE_GFX_VERSION — masks gfx1200 (RX 9060 XT) as 12.0.0 so that
-    #   MIOpen, HIP, and AOTriton compile correct kernels for the consumer ISA.
-    #   Without this, the runtime falls back to generic paths that mis-compile VAE
-    #   conv ops and trigger hipErrorLaunchFailure during decode.
-    os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "12.0.0")
+    _profile = _rocm_profile()
+    _debug_logs = os.environ.get("SD_ROCM_DEBUG_LOGS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if _profile == "w7800":
+        # Let gfx1100 run natively. Clear stale parent-shell overrides from older
+        # hardware profiles so ROCm compiles for the card actually installed.
+        if os.environ.get("HSA_OVERRIDE_GFX_VERSION") == "12.0.0":
+            os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    elif _profile == "compat":
+        # Compatibility keeps the prior conservative override available for the
+        # older gfx1200-oriented runtime profile.
+        os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "12.0.0")
     # MIOPEN_FIND_MODE=2 — skips exhaustive kernel benchmarking; uses the
     #   pre-compiled heuristic DB instead. Benchmarking mode executes micro-kernels
     #   that contain unresolved memory-indexing bugs on the narrow (wf32) wavefront.
@@ -89,16 +105,18 @@ if _is_rocm():
     #   manifests as hipErrorLaunchFailure in the conv upsampler. Hard-override
     #   (not setdefault) so a stale ~/.bashrc value cannot sneak back in.
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = "garbage_collection_threshold:0.8"
-    # Enable ROCm runtime and GEMM logging at moderate verbosity.
-    # ROCBLAS_LAYER=1 logs API call shapes only — value 2 triggers an exhaustive
-    # benchmark sweep of every solution per GEMM, causing minutes of pre-denoise stall.
-    os.environ.setdefault("ROCBLAS_LAYER", "1")
-    # MIOpen logs go to stderr; stderr is mirrored to project log files above.
-    os.environ.setdefault("MIOPEN_ENABLE_LOGGING", "1")
-    os.environ.setdefault("MIOPEN_LOG_LEVEL", "4")
-    # TORCH_LOGS="+inductor" prints inductor compilation decisions (fusion, tiling,
-    # vectorisation passes) to stderr.  Remove once you've seen enough.
-    os.environ.setdefault("TORCH_LOGS", "+inductor")
+    if _debug_logs:
+        # Enable ROCm runtime and GEMM logging at moderate verbosity only when
+        # explicitly debugging. Leaving these on during perf runs creates a lot
+        # of synchronous stderr/file traffic around the hot path.
+        # ROCBLAS_LAYER=1 logs API call shapes only; value 2 triggers an exhaustive
+        # benchmark sweep of every solution per GEMM, causing minutes of pre-denoise stall.
+        os.environ.setdefault("ROCBLAS_LAYER", "1")
+        # MIOpen logs go to stderr; stderr is mirrored to project log files above.
+        os.environ.setdefault("MIOPEN_ENABLE_LOGGING", "1")
+        os.environ.setdefault("MIOPEN_LOG_LEVEL", "4")
+        # TORCH_LOGS="+inductor" prints inductor compilation decisions.
+        os.environ.setdefault("TORCH_LOGS", "+inductor")
     # ROCBLAS_USE_HIPBLASLT=0 was tested to force Tensile backend for the gfx1200
     # VAE upsampler SIGABRT, but it broke dispatch for standard GEMM shapes in the
     # CLIP text encoder (RuntimeError: Expected iter != ops_.end()).  Do not re-enable.
@@ -120,14 +138,22 @@ from src.nodes.outpainting_node import OutpaintingInputs, OutpaintingNode
 from src.nodes.image2image import Image2ImageNode, Image2ImageInputs
 from src.nodes.response_node import ResponseInputs, ResponseNode
 from src.nodes.text2image import Text2ImageInputs, Text2ImageNode
+from src.nodes.qwen_node import (
+    QwenInputs,
+    QwenNode,
+    replace_negative_prompt_embeds,
+)
+from src.nodes.spatial_assets_node import SpatialAssetsNode, SpatialAssetsInputs
+
+# from src.nodes.compel_node import CompelInputs, CompelNode
 from src.executor import execute_dag
 from src.nodes.base_node import BaseNode
-from src.nodes.compel_node import CompelNode, CompelInputs
 from src.models import (
     DAGForm,
     Image2ImageRequest,
     ImageRequest,
     OutpaintRequest,
+    SpatialAssetsRequest,
     Text2ImageRequest,
 )
 from compel import CompelForSDXL
@@ -618,10 +644,18 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
         "watermark, oversmoothed, deformed"
     )
 
-    compel_node = CompelNode(request.nodes["0"])
-    hires_compel_node = CompelNode(
-        CompelInputs(prompt=_HIRES_PROMPT, negative_prompt=_HIRES_NEGATIVE, model=model)
+    qwen_node = QwenNode(request.nodes["0"])
+    # compel_node = CompelNode(request.nodes["0"])
+    hires_qwen_node = QwenNode(
+        QwenInputs(prompt=_HIRES_PROMPT, negative_prompt=_HIRES_NEGATIVE, model=model)
     )
+    # hires_compel_node = CompelNode(
+    #     CompelInputs(
+    #         prompt=_HIRES_PROMPT,
+    #         negative_prompt=_HIRES_NEGATIVE,
+    #         model=model,
+    #     )
+    # )
     if request.init_image is not None:
         image_node = Image2ImageNode(request.nodes["1"])
     else:
@@ -632,8 +666,10 @@ def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
     transform_node = TransformNode(TransformInputs())
     response_node = ResponseNode()
 
-    embeds = compel_node()
-    hires_embeds = hires_compel_node()
+    embeds = qwen_node()
+    # embeds = compel_node()
+    hires_embeds = hires_qwen_node()
+    # hires_embeds = hires_compel_node()
     if request.init_image is not None:
         images = image_node(images=[request.init_image], **embeds)
     else:
@@ -654,6 +690,13 @@ async def execute_outpaint_workflow(
     print("Pausing LLM Inference...")
     await pause_llm()
 
+    # qwen_node = QwenNode(
+    #     QwenInputs(
+    #         prompt=request.user_input,
+    #         negative_prompt=request.negative_input,
+    #         model=request.model,
+    #     )
+    # )
     compel_node = CompelNode(
         CompelInputs(
             prompt=request.user_input,
@@ -678,6 +721,7 @@ async def execute_outpaint_workflow(
     )
     # Aggressively free VRAM before outpainting, which is memory-hungry
     response_node = ResponseNode(ResponseInputs(stream=stream))
+    # embeds = qwen_node()
     embeds = compel_node()
     transformed = transform_node(
         fit_resize=True, images=[Image.open(request.reference.file).convert("RGB")]
@@ -698,6 +742,13 @@ async def execute_inpaint_workflow(
     print("Pausing LLM Inference...")
     await pause_llm()
 
+    # qwen_node = QwenNode(
+    #     QwenInputs(
+    #         prompt=request.user_input,
+    #         negative_prompt=request.negative_input,
+    #         model=request.model,
+    #     )
+    # )
     compel_node = CompelNode(
         CompelInputs(
             prompt=request.user_input,
@@ -722,15 +773,43 @@ async def execute_inpaint_workflow(
     )
     # Aggressively free VRAM before outpainting, which is memory-hungry
     response_node = ResponseNode(ResponseInputs(stream=stream))
+    # embeds = qwen_node()
     embeds = compel_node()
+    inputs = {}
+    with Image.open(request.mask.file) as mask_file:
+        mask_image = mask_file.convert("L")
+    with Image.open(request.reference.file) as reference_file:
+        reference_image = reference_file.convert("RGB")
+
     transformed = transform_node(
-        images=[Image.open(request.reference.file).convert("RGB")],
-        masks=[Image.open(request.mask.file).convert("L")],
+        images=[reference_image],
+        masks=[mask_image],
         fill_color="black",
     )
+    if request.depth_map and request.depth_map_scale:
+        print("Depth map and scale provided, adding to inpaint masked area...")
+        with Image.open(request.depth_map.file) as depth_map:
+            transformed_depth = transform_node(
+                images=[depth_map.convert("RGB")],
+                masks=[mask_image],
+                fill_color="black",
+            )
+        inputs["depthmap"] = transformed_depth["images"][0]
+        inputs["depthmap_scale"] = request.depth_map_scale
+    if request.edges_map and request.edges_map_scale:
+        print("Edges map and scale provided, adding to inpaint masked area...")
+        with Image.open(request.edges_map.file) as edges_map:
+            transformed_edges = transform_node(
+                images=[edges_map.convert("RGB")],
+                masks=[mask_image],
+                fill_color="black",
+            )
+        inputs["edgesmap"] = transformed_edges["images"][0]
+        inputs["edgesmap_scale"] = request.edges_map_scale
     outpainted = outpaint_node(
         images=transformed["images"],
         masks=transformed["masks"],
+        **inputs,
         **embeds,
     )
     return response_node(**outpainted)
@@ -744,6 +823,13 @@ async def execute_image2image_workflow(
     print("Pausing LLM Inference...")
     await pause_llm()
 
+    # qwen_node = QwenNode(
+    #     QwenInputs(
+    #         prompt=request.user_input,
+    #         negative_prompt=request.negative_input,
+    #         model=request.model,
+    #     )
+    # )
     compel_node = CompelNode(
         CompelInputs(
             prompt=request.user_input,
@@ -760,6 +846,7 @@ async def execute_image2image_workflow(
     )
     # Aggressively free VRAM before outpainting, which is memory-hungry
     response_node = ResponseNode(ResponseInputs(stream=stream))
+    # embeds = qwen_node()
     embeds = compel_node()
     if request.ip_adapter_image and request.ip_adapter_scale:
         print("IP-Adapter image and scale provided, adding to Image2ImageNode...")
@@ -781,21 +868,17 @@ async def execute_image2image_workflow(
 
 @app.post("/workflows/txt2img")
 async def execute_text2image_workflow(
-    request: Text2ImageRequest = Depends(Text2ImageRequest.as_form), stream=False
+    request: Text2ImageRequest = Depends(Text2ImageRequest.as_form),
+    stream=False,
+    version: str = "v1",
 ):
-    cleanup_resources()
-    print("Pausing LLM Inference...")
-    await pause_llm()
+    # cleanup_resources()
+    # print("Pausing LLM Inference...")
+    # await pause_llm()
 
-    compel_node = CompelNode(
-        CompelInputs(
-            prompt=request.user_input,
-            negative_prompt=request.negative_input,
-            model=request.model,
-        )
-    )
     txt2img_node = Text2ImageNode(
         Text2ImageInputs(
+            cfg_scale=request.cfg_scale,
             model=request.model,
             steps=request.steps,
         )
@@ -804,9 +887,10 @@ async def execute_text2image_workflow(
     use_edgesmap = request.edges_map and request.edges_map_scale
     use_controlnet = use_depthmap or use_edgesmap
     use_ip_adapter = request.ip_adapter_image and request.ip_adapter_scale
+
     # Aggressively free VRAM before outpainting, which is memory-hungry
     response_node = ResponseNode(ResponseInputs(stream=stream))
-    embeds = compel_node()
+    embeds = _build_txt2img_conditioning(request, version)
     inputs = {}
     if use_depthmap:
         print(
@@ -830,22 +914,58 @@ async def execute_text2image_workflow(
     return response_node(**image, stream=stream)
 
 
-@app.post("/workflows/image/")
-def execute_workflows(request: DAGForm = Depends(DAGForm.as_form)):
-
-    compel_node = CompelNode(request.nodes["0"])
-    if request.init_image is not None:
-        image_node = Image2ImageNode(request.nodes["1"])
+def _build_txt2img_conditioning(request: Text2ImageRequest, version="v1"):
+    if request.prompt_embedding == "qwen":
+        qwen_node = QwenNode(
+            QwenInputs(
+                qwen_model_path=os.environ.get(
+                    "QWEN_MODEL_PATH",
+                    "/home/adrien/my_models/qwen3.5-27b/qwen3.5-27b.gguf",
+                ),
+                projector_path=f"/home/adrien/sd_projectors/qwen_sdxl_projector_{version}.gguf",
+                qwen_normalize_embeddings=request.normalize_embeddings,
+                use_input_layernorm=request.use_input_layernorm,
+                qwen_n_gpu_layers=0,
+                qwen_n_ctx=512,
+                prompt=request.user_input,
+                negative_prompt=request.negative_input,
+                model=request.model,
+                qwen_use_cached_negative_prompt_embeds=False,
+            )
+        )
+        compel_node = CompelNode(
+            CompelInputs(
+                prompt=request.user_input,
+                negative_prompt=request.negative_input,
+                model=request.model,
+            )
+        )
+        return replace_negative_prompt_embeds(qwen_node(), compel_node())
     else:
-        image_node = Text2ImageNode(request.nodes["1"])
+        compel_node = CompelNode(
+            CompelInputs(
+                prompt=request.user_input,
+                negative_prompt=request.negative_input,
+                model=request.model,
+            )
+        )
+        return compel_node()
+
+
+@app.post("/workflows/spatial_assets")
+async def execute_spatial_assets_workflow(
+    request: SpatialAssetsRequest = Depends(SpatialAssetsRequest.as_form),
+    stream=True,
+):
+    cleanup_resources()
+    print("Pausing LLM Inference...")
+    await pause_llm()
+
+    spatial_assets_node = SpatialAssetsNode(SpatialAssetsInputs())
     response_node = ResponseNode()
-
-    embeds = compel_node()
-    if request.init_image is not None:
-        images = image_node(images=[request.init_image], **embeds)
-    else:
-        images = image_node(**embeds)
-    return response_node(**images)
+    with Image.open(request.image.file) as image:
+        assets = spatial_assets_node(images=[image.convert("RGB")])
+    return response_node(**assets)
 
 
 @app.post("/cleanup")

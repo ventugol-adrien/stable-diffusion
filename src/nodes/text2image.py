@@ -11,9 +11,10 @@ from src.pipeline import (
     decode_latents_safe,
     attach_inference_timing,
     finalize_inference_timing,
+    should_force_latent_output,
+    should_use_manual_vae_decode,
 )
 from src.nodes.base_node import BaseNode, BaseNodeModel
-from src.utils import is_rocm
 
 IP_ADAPTER_DIR = Path("/home/adrien/ip_adapters")
 
@@ -67,7 +68,9 @@ class Text2ImageNode(BaseNode):
         self.embeds = None
 
     def __call__(self, *args, **kwargs) -> dict[str, list[Image.Image]]:
-        force_latent = is_rocm() and self.params.output_type == "pil"
+        force_latent = (
+            should_force_latent_output() or should_use_manual_vae_decode()
+        ) and self.params.output_type == "pil"
         use_ip_adapter = kwargs.get("ip_adapter_image", None) and kwargs.get(
             "ip_adapter_scale", None
         )
@@ -86,6 +89,10 @@ class Text2ImageNode(BaseNode):
             "num_images_per_prompt": self.params.num_images_per_prompt,
             "output_type": "latent" if force_latent else self.params.output_type,
         }
+        if should_use_manual_vae_decode() and self.params.output_type == "pil":
+            print(
+                "[Perf] SD_MANUAL_VAE_DECODE=1: requesting latents, then timing VAE decode separately."
+            )
         if use_ip_adapter:
             pipe_kwargs["ip_adapter_image"] = kwargs["ip_adapter_image"]
             print(f"Using IP Adapter with scale {kwargs['ip_adapter_scale']}")
@@ -145,9 +152,18 @@ class Text2ImageNode(BaseNode):
 
         print(pipe.__class__.__name__)
         print(pipe.scheduler.__class__.__name__)
-        pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="text2image")
+        pipe_kwargs, t0, sampler = attach_inference_timing(
+            pipe_kwargs,
+            label="text2image",
+            metadata={
+                "model": self.params.model,
+                "use_ip_adapter": bool(use_ip_adapter),
+                "use_controlnet": bool(use_controlnet),
+                "manual_vae_decode": bool(should_use_manual_vae_decode()),
+            },
+        )
         output = pipe(**pipe_kwargs).images
-        finalize_inference_timing("text2image", t0)
+        finalize_inference_timing("text2image", t0, sampler)
         if isinstance(output, torch.Tensor):
             _m = output.float().mean().item()
             _s = output.float().std().item()

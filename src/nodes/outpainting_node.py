@@ -1,9 +1,11 @@
-from diffusers import ControlNetModel, DPMSolverMultistepScheduler
+from diffusers import ControlNetUnionModel, DPMSolverMultistepScheduler
 import numpy as np
 from diffusers import (
     AutoPipelineForInpainting,
     StableDiffusionXLControlNetPipeline,
     StableDiffusionXLControlNetInpaintPipeline,
+    StableDiffusionXLControlNetUnionPipeline,
+    StableDiffusionXLControlNetUnionInpaintPipeline,
     StableDiffusionXLInpaintPipeline,
 )
 from pydantic import Field
@@ -16,10 +18,12 @@ from src.pipeline import (
     encode_image_safe,
     attach_inference_timing,
     finalize_inference_timing,
+    needs_rocm_vae_cpu_workaround,
+    should_force_latent_output,
     register_cleanup_hook,
 )
 from src.nodes.base_node import BaseNode, BaseNodeModel
-from src.utils import is_rocm, has_vram_gte
+from src.utils import has_vram_gte
 
 _EMBED_KEYS = {
     "prompt_embeds",
@@ -29,11 +33,15 @@ _EMBED_KEYS = {
 }
 
 _CONTROLNET_ID = "xinsir/controlnet-union-sdxl-1.0"
-_controlnet_cache: ControlNetModel | None = None
+_UNION_CONTROL_DEPTH = 1
+_UNION_CONTROL_EDGES = 3
+_controlnet_cache: ControlNetUnionModel | None = None
 _cn_pipe_cache: dict[
     str,
     StableDiffusionXLControlNetPipeline
     | StableDiffusionXLControlNetInpaintPipeline
+    | StableDiffusionXLControlNetUnionPipeline
+    | StableDiffusionXLControlNetUnionInpaintPipeline
     | StableDiffusionXLInpaintPipeline,
 ] = {}
 
@@ -58,6 +66,8 @@ def _get_cn_pipe(
 ) -> (
     StableDiffusionXLControlNetPipeline
     | StableDiffusionXLControlNetInpaintPipeline
+    | StableDiffusionXLControlNetUnionPipeline
+    | StableDiffusionXLControlNetUnionInpaintPipeline
     | StableDiffusionXLInpaintPipeline
 ):
     global _controlnet_cache, _cn_pipe_cache
@@ -77,14 +87,14 @@ def _get_cn_pipe(
             # High VRAM: load ControlNet and build a ControlNet-guided pipeline.
             if _controlnet_cache is None:
                 print(f"📦 Loading ControlNet: {_CONTROLNET_ID}")
-                _controlnet_cache = ControlNetModel.from_pretrained(
+                _controlnet_cache = ControlNetUnionModel.from_pretrained(
                     _CONTROLNET_ID, torch_dtype=torch.float16
                 ).to("cuda")
             print(f"📦 Building ControlNet pipeline for model: {model}")
             pipeline_cls = (
-                StableDiffusionXLControlNetInpaintPipeline
+                StableDiffusionXLControlNetUnionInpaintPipeline
                 if is_inpaint_unet
-                else StableDiffusionXLControlNetPipeline
+                else StableDiffusionXLControlNetUnionPipeline
             )
             cn_pipe = pipeline_cls(
                 vae=base.vae,
@@ -104,7 +114,7 @@ def _get_cn_pipe(
             )
             cn_pipe = AutoPipelineForInpainting.from_pipe(base)
 
-        if is_rocm() and hasattr(cn_pipe, "_encode_vae_image"):
+        if needs_rocm_vae_cpu_workaround() and hasattr(cn_pipe, "_encode_vae_image"):
             # gfx1200 GPU VAE encoder silently produces zeros (hipErrorLaunchFailure).
             # Encode on the dedicated CPU VAE to avoid this. Critically, do NOT convert
             # to PIL first — PIL clamps to uint8 (256 levels), introducing an 8-bit
@@ -190,6 +200,18 @@ def _apply_mask_to_image(img: Image.Image, mask: Image.Image) -> Image.Image:
     return Image.fromarray((masked * 255).astype(np.uint8), mode="RGB")
 
 
+def _apply_mask_to_control_map(
+    control_map: Image.Image, mask: Image.Image, size: tuple[int, int]
+) -> Image.Image:
+    """Keep a user-provided control map only in the fill zone (mask=255)."""
+    control_arr = np.array(
+        control_map.convert("RGB").resize(size, Image.LANCZOS), dtype=np.float32
+    )
+    mask_arr = np.array(mask.convert("L").resize(size, Image.NEAREST), dtype=np.float32)
+    masked = control_arr * (mask_arr[..., None] / 255.0)
+    return Image.fromarray(np.clip(masked, 0, 255).astype(np.uint8), mode="RGB")
+
+
 class OutpaintingNode(BaseNode):
     output_key = "images"
 
@@ -239,19 +261,29 @@ class OutpaintingNode(BaseNode):
                 for m in masks_pipeline
             ]
 
-        force_latent = is_rocm()
+        force_latent = should_force_latent_output()
         is_cn_pipe = isinstance(
             pipe,
             (
                 StableDiffusionXLControlNetPipeline,
                 StableDiffusionXLControlNetInpaintPipeline,
+                StableDiffusionXLControlNetUnionPipeline,
+                StableDiffusionXLControlNetUnionInpaintPipeline,
             ),
         )
         is_inpaint_pipe = isinstance(
             pipe,
             (
                 StableDiffusionXLControlNetInpaintPipeline,
+                StableDiffusionXLControlNetUnionInpaintPipeline,
                 StableDiffusionXLInpaintPipeline,
+            ),
+        )
+        is_union_pipe = isinstance(
+            pipe,
+            (
+                StableDiffusionXLControlNetUnionPipeline,
+                StableDiffusionXLControlNetUnionInpaintPipeline,
             ),
         )
         pipe_kwargs = {
@@ -293,9 +325,45 @@ class OutpaintingNode(BaseNode):
             pipe_kwargs["image"] = init_images
             pipe_kwargs["mask_image"] = masks_pipeline
             if is_cn_pipe:
-                # Zeroed-out control image: ControlNet sees existing structure on one
-                # side and a neutral void on the other — no white-pixel collision.
-                pipe_kwargs["control_image"] = masked_control_images
+                control_images: list[Image.Image] = []
+                control_modes: list[int] = []
+                control_scales: list[float] = []
+
+                if kwargs.get("depthmap") is not None:
+                    print(
+                        "Using inpaint ControlNet depth map inside masked area "
+                        f"with scale {kwargs.get('depthmap_scale')}"
+                    )
+                    control_images.append(
+                        _apply_mask_to_control_map(
+                            kwargs["depthmap"], sharp_masks[0], (p.width, p.height)
+                        )
+                    )
+                    control_modes.append(_UNION_CONTROL_DEPTH)
+                    control_scales.append(float(kwargs.get("depthmap_scale") or 0.6))
+
+                if kwargs.get("edgesmap") is not None:
+                    print(
+                        "Using inpaint ControlNet edge map inside masked area "
+                        f"with scale {kwargs.get('edgesmap_scale')}"
+                    )
+                    control_images.append(
+                        _apply_mask_to_control_map(
+                            kwargs["edgesmap"], sharp_masks[0], (p.width, p.height)
+                        )
+                    )
+                    control_modes.append(_UNION_CONTROL_EDGES)
+                    control_scales.append(float(kwargs.get("edgesmap_scale") or 0.2))
+
+                if control_images:
+                    pipe_kwargs["control_image"] = control_images
+                    pipe_kwargs["controlnet_conditioning_scale"] = control_scales
+                    if is_union_pipe:
+                        pipe_kwargs["control_mode"] = control_modes
+                else:
+                    # Zeroed-out control image: ControlNet sees existing structure on one
+                    # side and a neutral void on the other — no white-pixel collision.
+                    pipe_kwargs["control_image"] = masked_control_images
         else:
             # Non-inpainting ControlNet: image IS the ControlNet conditioning input.
             # Pass the zeroed version so white pixels don't appear as geometry.
@@ -308,9 +376,19 @@ class OutpaintingNode(BaseNode):
         embed_kwargs = {k: v for k, v in kwargs.items() if k in _EMBED_KEYS}
         pipe_kwargs.update(embed_kwargs)
 
-        pipe_kwargs, t0 = attach_inference_timing(pipe_kwargs, label="outpainting")
+        pipe_kwargs, t0, sampler = attach_inference_timing(
+            pipe_kwargs,
+            label="outpainting",
+            metadata={
+                "model": p.model,
+                "strength": p.strength,
+                "is_controlnet": bool(is_cn_pipe),
+                "is_inpaint": bool(is_inpaint_pipe),
+                "is_union": bool(is_union_pipe),
+            },
+        )
         output = pipe(**pipe_kwargs).images
-        finalize_inference_timing("outpainting", t0)
+        finalize_inference_timing("outpainting", t0, sampler)
 
         if force_latent and isinstance(output, torch.Tensor):
             output = decode_latents_safe(pipe, output)
