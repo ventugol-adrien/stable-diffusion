@@ -73,6 +73,19 @@ uv sync
 
 **NVIDIA CUDA 12.8:**
 
+The pinned `llama-cpp-python` package builds from source and requires a C/C++
+toolchain. On Debian/Ubuntu, install it before syncing:
+
+```bash
+sudo apt-get update
+sudo apt-get install build-essential
+cc --version
+c++ --version
+```
+
+If CMake reports that it cannot find `CC=cc` or that `CMAKE_CXX_COMPILER` is
+not set, the compiler toolchain is missing or is not on `PATH`.
+
 ```bash
 uv run python scripts/profile.py sync cuda
 ```
@@ -81,6 +94,16 @@ This selects PyTorch 2.9.1, torchaudio 2.9.1, and torchvision 0.24.1 from the
 CUDA 12.8 index. It requires a compatible NVIDIA driver and enough disk space
 for the CUDA libraries. The custom ROCm FlashAttention wheel is not used.
 The CUDA lockfile is generated on the first successful sync.
+
+The PyTorch CUDA wheels do not enable CUDA in a source build of
+`llama-cpp-python`. GPU acceleration for that package additionally requires a
+CUDA toolkit with `nvcc` and building with `CMAKE_ARGS="-DGGML_CUDA=on"`.
+
+When running `uv sync --project profiles/cuda --python 3.12` directly, a
+warning about an active root `.venv` is harmless: uv uses
+`profiles/cuda/.venv` to keep the GPU profile isolated. Deactivate the root
+environment first to suppress the warning; do not use `--active` unless you
+intend to install into that environment.
 
 **AMD ROCm:**
 

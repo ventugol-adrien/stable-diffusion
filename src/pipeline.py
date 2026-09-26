@@ -459,7 +459,10 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
     (from_pretrained is ~3× faster than from_single_file). On first load
     the model is converted and cached automatically.
     """
-    cached_dir = MODEL_CACHE_DIR / model
+    checkpoint_path = Path(model).expanduser()
+    is_checkpoint_path = checkpoint_path.is_file()
+    cache_key = checkpoint_path.stem if is_checkpoint_path else model
+    cached_dir = MODEL_CACHE_DIR / cache_key
 
     # FAST PATH: diffusers cache exists (VAE is already madebyollin/sdxl-vae-fp16-fix,
     # baked in when the cache was saved — no need to reload it from HF hub).
@@ -475,7 +478,9 @@ def _load_pipeline(model: str) -> StableDiffusionXLPipeline:
         return pipe
 
     # SLOW PATH: first-time load from single .safetensors file
-    target_model_path = Path.home() / "sd_models" / f"{model}.safetensors"
+    target_model_path = (
+        checkpoint_path if is_checkpoint_path else MODELS_DIR / f"{model}.safetensors"
+    )
 
     print(f"📦 Loading FP16-Fixed VAE: {VAE_ID}")
     vae = AutoencoderKL.from_pretrained(VAE_ID, torch_dtype=DTYPE)
