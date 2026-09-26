@@ -22,8 +22,8 @@ A high-performance SDXL image generation API built with **FastAPI**, optimized f
 
 | Dependency                                                      | Purpose                            |
 | --------------------------------------------------------------- | ---------------------------------- |
-| Python 3.10+                                                    | Runtime                            |
-| PyTorch (ROCm)                                                  | GPU compute                        |
+| Python 3.12                                                     | Runtime for the GPU profiles       |
+| PyTorch (CUDA or ROCm)                                           | GPU compute                        |
 | [Diffusers](https://github.com/huggingface/diffusers) ≥ 0.36    | SDXL pipeline                      |
 | [Compel](https://github.com/damian0815/compel)                  | Prompt weighting / conditioning    |
 | [FastAPI](https://fastapi.tiangolo.com/)                        | HTTP server                        |
@@ -64,9 +64,37 @@ A high-performance SDXL image generation API built with **FastAPI**, optimized f
 
 ### 1. Install dependencies
 
+Install the shared tools once, then choose a GPU profile. The root project
+contains only test/lint tooling; CUDA and ROCm dependencies remain isolated.
+
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+**NVIDIA CUDA 12.8:**
+
+```bash
+uv run python scripts/profile.py sync cuda
+```
+
+This selects PyTorch 2.9.1, torchaudio 2.9.1, and torchvision 0.24.1 from the
+CUDA 12.8 index. It requires a compatible NVIDIA driver and enough disk space
+for the CUDA libraries. The custom ROCm FlashAttention wheel is not used.
+The CUDA lockfile is generated on the first successful sync.
+
+**AMD ROCm:**
+
+```bash
+uv run python scripts/profile.py sync rocm
+```
+
+This preserves the original pinned packages and custom wheels under
+`/home/adrien/`. Those wheels must be present on the ROCm machine. To reuse an
+existing root `.venv`, prefix both sync and run commands with
+`UV_PROJECT_ENVIRONMENT="$PWD/.venv"`.
+
+Keep shared dependency changes in both profiles. Do not combine the profiles
+into a uv workspace: CUDA resolution must not require the local ROCm wheels.
 
 ### 2. Place models
 
@@ -89,9 +117,25 @@ Put LoRA `.safetensors` files in `~/sd_loras/`:
 
 ### 4. Run the server
 
+Run from the repository root, selecting the same profile used for installation:
+
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+uv run python scripts/profile.py run cuda
 ```
+
+On AMD, replace `cuda` with `rocm`.
+
+### 5. Run tests and lint
+
+Tests execute inside the selected GPU profile, so imports use the matching
+PyTorch backend:
+
+```bash
+uv run python scripts/profile.py test cuda
+uv run ruff check .
+```
+
+On the AMD machine, replace `cuda` with `rocm` for the test command.
 
 ## Environment Variables
 
